@@ -1,0 +1,72 @@
+services:
+  geth:
+    image: ethereum/client-go:latest
+    ports:
+      - "8545:8545"  # HTTP RPC
+      - "8546:8546"  # WebSocket RPC
+      - "8551:8551"  # Engine API
+      - "30303:30303"  # P2P
+    volumes:
+      - ./jwt.hex:/jwt.hex
+      - ./geth_data:/root/.ethereum
+      - ./geth_data/genesis.json:/genesis.json
+    command:
+      - --networkid=1337
+      - --nodiscover
+      - --datadir=/root/.ethereum
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      - --http.api=eth,net,engine,admin
+      - --http.corsdomain=*
+      - --http.vhosts=*
+      - --ws
+      - --ws.addr=0.0.0.0
+      - --ws.port=8546
+      - --ws.api=eth,net,engine
+      - --ws.origins=*
+      - --authrpc.addr=0.0.0.0
+      - --authrpc.port=8551
+      - --authrpc.vhosts=*
+      - --authrpc.jwtsecret=/jwt.hex
+      - --syncmode=full
+      - --gcmode=archive
+      - --txlookuplimit=0
+    restart: unless-stopped
+
+  cometbft:
+    image: cometbft/cometbft:latest
+    ports:
+      - "26656:26656"  # P2P
+      - "26657:26657"  # RPC
+      - "26658:26658"  # GRPC
+    volumes:
+      - ./cometbft_home:/cometbft
+    command:
+      - start
+      - --home=/cometbft
+      - --proxy_app=tcp://ethbft:8080
+      - --rpc.laddr=tcp://0.0.0.0:26657
+      - --p2p.laddr=tcp://0.0.0.0:26656
+    restart: unless-stopped
+
+  ethbft:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+      - "8081:8081" # Health check port
+    volumes:
+      - ./config/docker-config.json:/app/config.json
+      - ./jwt.hex:/app/jwt.hex
+    environment:
+      - ETHBFT_CONFIG=/app/config.json
+    depends_on:
+      - geth
+    restart: unless-stopped
+    # Make sure our container is accessible to others
+    networks:
+      default:
+        aliases:
+          - ethbft
