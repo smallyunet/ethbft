@@ -1,11 +1,14 @@
+version: "3.8"
+
 services:
   geth:
     image: ethereum/client-go:latest
+    container_name: ethbft-geth
     ports:
-      - "8545:8545"  # HTTP RPC
-      - "8546:8546"  # WebSocket RPC
-      - "8551:8551"  # Engine API
-      - "30303:30303"  # P2P
+      - "8545:8545"   # HTTP RPC
+      - "8546:8546"   # WebSocket RPC
+      - "8551:8551"   # Engine API
+      - "30303:30303" # P2P
     volumes:
       - ./jwt.hex:/jwt.hex
       - ./geth_data:/root/.ethereum
@@ -34,29 +37,14 @@ services:
       - --txlookuplimit=0
     restart: unless-stopped
 
-  cometbft:
-    image: cometbft/cometbft:latest
-    ports:
-      - "26656:26656"  # P2P
-      - "26657:26657"  # RPC
-      - "26658:26658"  # GRPC
-    volumes:
-      - ./cometbft_home:/cometbft
-    command:
-      - start
-      - --home=/cometbft
-      - --proxy_app=tcp://ethbft:8080
-      - --rpc.laddr=tcp://0.0.0.0:26657
-      - --p2p.laddr=tcp://0.0.0.0:26656
-    restart: unless-stopped
-
   ethbft:
     build:
       context: .
       dockerfile: Dockerfile
+    container_name: ethbft-app
     ports:
-      - "8080:8080"
-      - "8081:8081" # Health check port
+      - "8080:8080" # ABCI socket
+      - "8081:8081" # Health check (your app should expose this)
     volumes:
       - ./config/docker-config.json:/app/config.json
       - ./jwt.hex:/app/jwt.hex
@@ -64,9 +52,26 @@ services:
       - ETHBFT_CONFIG=/app/config.json
     depends_on:
       - geth
+    # Healthcheck ensures cometbft starts only after ethbft is ready
+    healthcheck:
+      test: ["CMD", "sh", "-c", "nc -z 127.0.0.1 8081 || nc -z 127.0.0.1 8080"]
+      interval: 2s
+      timeout: 1s
+      retries: 60
     restart: unless-stopped
-    # Make sure our container is accessible to others
-    networks:
-      default:
-        aliases:
-          - ethbft
+
+  cometbft:
+    image: cometbft/cometbft:v0.38.17
+    container_name: ethbft-cometbft
+    depends_on:
+      ethbft:
+        condition: service_healthy
+    entrypoint: ["/start-cometbft.sh"]
+    ports:
+      - "26656:26656"
+      - "26657:26657"
+    volumes:
+      - ./cometbft_home:/cometbft
+      - ./scripts/start-cometbft.sh:/start-cometbft.sh
+    restart: unless-stopped
+

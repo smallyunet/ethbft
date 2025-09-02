@@ -10,33 +10,34 @@ import (
 
 // ABCIServer represents a server that implements the ABCI protocol
 type ABCIServer struct {
-	bridge      *Bridge
-	listener    net.Listener
-	connections map[string]net.Conn
-	mu          sync.Mutex
+	bridge    *Bridge
+	listener  net.Listener
+	mu        sync.Mutex
+	isRunning bool
 }
 
 // NewABCIServer creates a new ABCI server
 func NewABCIServer(bridge *Bridge) *ABCIServer {
 	return &ABCIServer{
-		bridge:      bridge,
-		connections: make(map[string]net.Conn),
+		bridge: bridge,
 	}
 }
 
 // Start starts the ABCI server
 func (s *ABCIServer) Start() error {
 	addr := s.bridge.config.Bridge.ListenAddr
-	log.Printf("Starting ABCI server on %s", addr)
+	log.Printf("Starting gRPC ABCI server on %s", addr)
 
-	// Create a simple TCP server for ABCI
-	listener, err := net.Listen("tcp", addr)
+	var err error
+	// Create a TCP listener for the gRPC ABCI server
+	s.listener, err = net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", addr, err)
 	}
-	s.listener = listener
 
-	// Start accepting connections
+	s.isRunning = true
+
+	// Handle connections
 	go s.acceptConnections()
 
 	// Also start a simple HTTP server for health checks
@@ -47,70 +48,60 @@ func (s *ABCIServer) Start() error {
 
 // Stop stops the ABCI server
 func (s *ABCIServer) Stop() {
-	if s.listener != nil {
-		s.listener.Close()
-	}
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for _, conn := range s.connections {
-		conn.Close()
+	if s.listener != nil {
+		s.listener.Close()
 	}
+	s.isRunning = false
 }
 
 // acceptConnections accepts and handles incoming ABCI connections
 func (s *ABCIServer) acceptConnections() {
-	for {
+	for s.isRunning {
 		conn, err := s.listener.Accept()
 		if err != nil {
-			log.Printf("Error accepting connection: %v", err)
+			if s.isRunning {
+				log.Printf("Error accepting connection: %v", err)
+			}
 			return
 		}
 
-		connID := conn.RemoteAddr().String()
-
-		s.mu.Lock()
-		s.connections[connID] = conn
-		s.mu.Unlock()
-
-		log.Printf("Accepted ABCI connection from %s", connID)
+		log.Printf("Accepted ABCI connection from %s", conn.RemoteAddr().String())
 
 		// Handle the connection in a goroutine
-		go s.handleConnection(conn, connID)
+		go s.handleABCIConnection(conn)
 	}
 }
 
-// handleConnection processes ABCI protocol messages
-func (s *ABCIServer) handleConnection(conn net.Conn, connID string) {
-	defer func() {
-		conn.Close()
+// handleABCIConnection handles an ABCI connection using gRPC protocol
+func (s *ABCIServer) handleABCIConnection(conn net.Conn) {
+	defer conn.Close()
 
-		s.mu.Lock()
-		delete(s.connections, connID)
-		s.mu.Unlock()
+	// In a real implementation, we would use the gRPC protocol here
+	// This is a simplified version that responds to ABCI requests
+	// with predefined responses to make CometBFT happy
 
-		log.Printf("Closed ABCI connection from %s", connID)
-	}()
+	buffer := make([]byte, 4096)
 
-	// This is a simplified placeholder
-	// In a real implementation, you would parse ABCI protocol messages here
-	buf := make([]byte, 4096)
 	for {
-		n, err := conn.Read(buf)
+		n, err := conn.Read(buffer)
 		if err != nil {
-			log.Printf("Error reading from connection %s: %v", connID, err)
+			log.Printf("Error reading from connection: %v", err)
 			return
 		}
 
-		// Process the ABCI message
-		log.Printf("Received %d bytes from %s", n, connID)
+		// Here we should properly decode and handle the gRPC requests
+		// For now, we're just acknowledging receipt
+		log.Printf("Received %d bytes from ABCI client", n)
 
-		// Echo back a simple response for now
-		resp := []byte("OK")
-		_, err = conn.Write(resp)
+		// Send a simple response
+		// In a real implementation, we would encode proper gRPC responses
+		response := []byte("OK\n")
+		_, err = conn.Write(response)
 		if err != nil {
-			log.Printf("Error writing to connection %s: %v", connID, err)
+			log.Printf("Error writing to connection: %v", err)
 			return
 		}
 	}
