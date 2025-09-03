@@ -1,131 +1,267 @@
 # EthBFT - Ethereum to CometBFT Bridge
 
-EthBFT is a lightweight bridge layer that connects Ethereum execution clients (like Geth) with CometBFT consensus. This project enables you to run a blockchain system using Ethereum's execution capabilities with CometBFT's fast and secure consensus mechanism.
+EthBFT is a lightweight bridge that connects Ethereum execution clients (like Geth) with CometBFT consensus. This project enables you to run a blockchain system using Ethereum's execution capabilities with CometBFT's fast and secure consensus mechanism.
 
-## Project Structure
+## 🚀 Features
+
+- **ABCI Application**: Full CometBFT ABCI interface implementation
+- **Engine API Server**: Ethereum Engine API compatibility layer
+- **Health Monitoring**: Built-in connection monitoring and health checks
+- **Docker Support**: Complete containerized deployment
+- **JWT Authentication**: Secure Engine API communication
+- **Lightweight**: Minimal dependencies, focused on core functionality
+
+## 📁 Project Structure
 
 ```
 ethbft/
-├── cmd/                    # Application entry points
-│   └── ethbft/             # Main EthBFT application
-├── config/                 # Configuration files
-├── docs/                   # Documentation
-├── internal/               # Private application code
-├── pkg/                    # Public libraries
+├── cmd/
+│   └── ethbft/             # Main application entry point
+├── pkg/
 │   ├── bridge/             # Bridge between Ethereum and CometBFT
-│   ├── config/             # Configuration handling
-│   ├── consensus/          # CometBFT client and integration
-│   ├── ethereum/           # Ethereum client and integration
-│   └── types/              # Shared types and data structures
-├── Makefile                # Build and development commands
-├── go.mod                  # Go module definition
-├── go.sum                  # Go module checksums
-└── README.md               # Project documentation
+│   │   ├── bridge.go      # Main bridge logic
+│   │   └── server.go       # ABCI server implementation
+│   ├── config/            # Configuration management
+│   ├── consensus/          # CometBFT client integration
+│   ├── engine/             # Ethereum Engine API server
+│   └── ethereum/           # Ethereum client integration
+├── config/                 # Configuration files
+├── scripts/                # Utility scripts
+├── docker-compose.yml      # Docker orchestration
+├── Dockerfile             # Container definition
+├── Makefile               # Build and development commands
+├── go.mod                 # Go module definition
+└── README.md              # This file
 ```
 
-## Quick Start
+## 🛠️ Prerequisites
 
-### Prerequisites
+- **Go 1.24+** (recommended: Go 1.24.6)
+- **Docker & Docker Compose** (for containerized deployment)
+- **OpenSSL** (for JWT secret generation)
 
-- Go 1.20 or later
-- Ethereum execution client (e.g., Geth)
-- CometBFT
+## ⚡ Quick Start
 
-### Building
+### Using Docker (Recommended)
 
 ```bash
 # Clone the repository
 git clone https://github.com/smallyunet/ethbft.git
 cd ethbft
 
-# Install dependencies and set up development environment
-make dev-setup
-
-# Build the project
-make build
-```
-
-### Running
-
-Using Docker:
-
-```bash
 # Start the complete stack (Geth + CometBFT + EthBFT)
 make docker-up
+
+# View logs
+docker-compose logs -f
 
 # Stop all containers
 make docker-down
 
-# Rebuild and restart all containers
+# Rebuild and restart
 make docker-rebuild
 ```
 
-Or run the application directly:
+### Manual Setup
 
 ```bash
-# Start the bridge
-make run
+# Clone and setup
+git clone https://github.com/smallyunet/ethbft.git
+cd ethbft
 
-# Or run directly
-./ethbft
+# Install dependencies
+make deps
+
+# Generate JWT secret
+make generate-jwt
+
+# Create genesis file
+make create-genesis
+
+# Build the application
+make build
+
+# Run the bridge
+make run
 ```
 
-## Configuration
+## 🔧 Configuration
 
-EthBFT can be configured using a YAML configuration file. A sample configuration file is provided in `config/config.yaml`.
+EthBFT uses YAML configuration files. Key configuration options:
 
-You can also set the configuration file path using the `ETHBFT_CONFIG` environment variable:
+### Main Configuration (`config.yaml`)
+
+```yaml
+ethereum:
+  endpoint: "http://localhost:8545"
+  engineAPI: "http://localhost:8551"
+  jwtSecret: "./jwt.hex"
+
+cometbft:
+  endpoint: "http://localhost:26657"
+
+bridge:
+  listenAddr: "0.0.0.0:8080"
+  retryInterval: 30
+```
+
+### Environment Variables
 
 ```bash
+# Set custom config path
 ETHBFT_CONFIG=/path/to/config.yaml ./ethbft
 ```
 
-Key configuration options:
+## 🏗️ Architecture
 
-- `ethereum.endpoint`: URL of your Ethereum execution client's JSON-RPC API
-- `cometbft.endpoint`: URL of your CometBFT node's RPC API
-- `bridge.retryInterval`: Seconds between connection retry attempts
+EthBFT acts as a bridge layer between Ethereum execution clients and CometBFT consensus:
 
-## Architecture
-
-EthBFT works as a bridge layer between Ethereum execution clients and CometBFT consensus by:
-
-1. Connecting to an Ethereum execution client to retrieve block data
-2. Processing this data into a format compatible with CometBFT
-3. Proposing blocks to CometBFT for consensus
-4. Relaying finalized blocks back to the Ethereum execution layer
-
-The design focuses on simplicity and reliability, avoiding complex state management whenever possible.
-
-## Development
-
-### Testing
-
-```bash
-# Run all tests
-make test
+```
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│    Geth     │◄──►│   EthBFT    │◄──►│  CometBFT   │
+│ (Execution)  │    │  (Bridge)   │    │ (Consensus) │
+└─────────────┘    └─────────────┘    └─────────────┘
 ```
 
-### Utility Commands
+### Components
+
+1. **ABCI Application**: Implements CometBFT's ABCI interface
+2. **Engine API Server**: Provides Ethereum Engine API compatibility
+3. **Bridge Logic**: Manages connections and data flow
+4. **Health Monitoring**: Monitors service connectivity
+
+## 🐳 Docker Services
+
+The Docker setup includes:
+
+- **ethbft-geth**: Ethereum execution client (Geth)
+- **ethbft-app**: EthBFT bridge application
+- **ethbft-cometbft**: CometBFT consensus node
+
+### Ports
+
+- `8545`: Geth HTTP RPC
+- `8546`: Geth WebSocket RPC
+- `8551`: Engine API server
+- `8080`: ABCI socket server
+- `8081`: Health check endpoint
+- `26656`: CometBFT P2P
+- `26657`: CometBFT RPC
+
+## 📊 Monitoring
+
+### Health Check
 
 ```bash
-# Generate JWT Secret for Ethereum Engine API
+# Check bridge health
+curl http://localhost:8081/health
+
+# Check CometBFT status
+curl http://localhost:26657/status
+
+# Check Geth status
+curl -X POST -H "Content-Type: application/json" \
+  --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+  http://localhost:8545
+```
+
+### Logs
+
+```bash
+# View all logs
+docker-compose logs -f
+
+# View specific service logs
+docker-compose logs -f ethbft-app
+docker-compose logs -f ethbft-cometbft
+docker-compose logs -f ethbft-geth
+```
+
+## 🛠️ Development
+
+### Available Commands
+
+```bash
+# Build the application
+make build
+
+# Run tests
+make test
+
+# Clean build artifacts
+make clean
+
+# Generate JWT secret
 make generate-jwt
 
-# Create genesis.json file
+# Create genesis file
 make create-genesis
 
-# Set up development environment
+# Setup development environment
 make dev-setup
 
-# Clean all data (JWT, chain data, etc.)
-make clean
+# Docker operations
+make docker-up
+make docker-down
+make docker-rebuild
 ```
 
-## License
+### Building from Source
+
+```bash
+# Build for current platform
+go build -o ethbft ./cmd/ethbft
+
+# Build for Linux (Docker)
+CGO_ENABLED=0 GOOS=linux go build -o ethbft ./cmd/ethbft
+```
+
+## 🔍 Troubleshooting
+
+### Common Issues
+
+1. **JWT Authentication Failed**
+   ```bash
+   # Regenerate JWT secret
+   make generate-jwt
+   make docker-rebuild
+   ```
+
+2. **CometBFT Connection Issues**
+   ```bash
+   # Check CometBFT logs
+   docker-compose logs cometbft
+   
+   # Restart services
+   make docker-rebuild
+   ```
+
+3. **Port Conflicts**
+   ```bash
+   # Check port usage
+   netstat -tulpn | grep :8080
+   
+   # Modify ports in docker-compose.yml
+   ```
+
+## 📝 License
 
 [MIT License](LICENSE)
 
-## Contributing
+## 🤝 Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome! Please feel free to submit issues and pull requests.
+
+### Development Workflow
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Add tests if applicable
+5. Submit a pull request
+
+## 📚 References
+
+- [CometBFT Documentation](https://docs.cometbft.com/)
+- [Ethereum Engine API](https://github.com/ethereum/execution-apis)
+- [ABCI Specification](https://docs.cometbft.com/v0.38/spec/abci/)
