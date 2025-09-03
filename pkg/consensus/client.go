@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/smallyunet/ethbft/pkg/config"
-	"github.com/smallyunet/ethbft/pkg/types"
 )
 
 // Client represents a CometBFT consensus client
@@ -110,25 +109,6 @@ func (c *Client) Call(ctx context.Context, method string, params interface{}) (j
 	return rpcResp.Result, nil
 }
 
-// BroadcastTx broadcasts a transaction to CometBFT
-func (c *Client) BroadcastTx(ctx context.Context, tx []byte) (*types.TxResults, error) {
-	params := map[string]interface{}{
-		"tx": tx,
-	}
-
-	result, err := c.Call(ctx, "broadcast_tx_sync", params)
-	if err != nil {
-		return nil, err
-	}
-
-	var txResult types.TxResults
-	if err := json.Unmarshal(result, &txResult); err != nil {
-		return nil, err
-	}
-
-	return &txResult, nil
-}
-
 // GetStatus gets the status of CometBFT node
 func (c *Client) GetStatus(ctx context.Context) (map[string]interface{}, error) {
 	result, err := c.Call(ctx, "status", nil)
@@ -142,17 +122,4 @@ func (c *Client) GetStatus(ctx context.Context) (map[string]interface{}, error) 
 	}
 
 	return status, nil
-}
-
-// ProposeBlock proposes a new block to CometBFT
-func (c *Client) ProposeBlock(ctx context.Context, data *types.ConsensusData) error {
-	// This is a simplified version
-	// In a real implementation, this would follow CometBFT's block proposal protocol
-
-	params := map[string]interface{}{
-		"data": data,
-	}
-
-	_, err := c.Call(ctx, "propose_block", params)
-	return err
 }

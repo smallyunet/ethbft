@@ -11,20 +11,17 @@ import (
 	abciserver "github.com/cometbft/cometbft/abci/server"
 	abcitypes "github.com/cometbft/cometbft/abci/types"
 	"github.com/smallyunet/ethbft/pkg/engine"
-	"github.com/smallyunet/ethbft/pkg/state"
 )
 
 // ABCIApplication implements the CometBFT ABCI interface
 type ABCIApplication struct {
-	bridge       *Bridge
-	stateManager *state.Manager
+	bridge *Bridge
 }
 
 // NewABCIApplication creates a new ABCI application instance
-func NewABCIApplication(bridge *Bridge, stateManager *state.Manager) *ABCIApplication {
+func NewABCIApplication(bridge *Bridge) *ABCIApplication {
 	return &ABCIApplication{
-		bridge:       bridge,
-		stateManager: stateManager,
+		bridge: bridge,
 	}
 }
 

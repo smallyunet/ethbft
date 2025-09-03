@@ -11,7 +11,6 @@ import (
 	"github.com/smallyunet/ethbft/pkg/consensus"
 	"github.com/smallyunet/ethbft/pkg/engine"
 	"github.com/smallyunet/ethbft/pkg/ethereum"
-	"github.com/smallyunet/ethbft/pkg/state"
 )
 
 // Bridge is the main component that connects Ethereum execution clients with CometBFT consensus
@@ -21,7 +20,6 @@ type Bridge struct {
 	consClient   *consensus.Client
 	abciServer   *ABCIServer
 	engineServer *engine.Server
-	stateManager *state.Manager
 	abciApp      *ABCIApplication
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -44,20 +42,16 @@ func NewBridge(cfg *config.Config) (*Bridge, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Create state manager
-	stateManager := state.NewManager(ethClient)
-
 	bridge := &Bridge{
-		config:       cfg,
-		ethClient:    ethClient,
-		consClient:   consClient,
-		stateManager: stateManager,
-		ctx:          ctx,
-		cancel:       cancel,
+		config:     cfg,
+		ethClient:  ethClient,
+		consClient: consClient,
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 
 	// Create enhanced ABCI application
-	bridge.abciApp = NewABCIApplication(bridge, stateManager)
+	bridge.abciApp = NewABCIApplication(bridge)
 
 	// Create the ABCI server with enhanced app
 	bridge.abciServer = NewABCIServer(bridge)
