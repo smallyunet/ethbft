@@ -1,124 +1,136 @@
 package bridge
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
-	"sync"
+	"time"
+
+	abciserver "github.com/cometbft/cometbft/abci/server"
+	abcitypes "github.com/cometbft/cometbft/abci/types"
 )
 
-// ABCIServer represents a server that implements the ABCI protocol
+// ABCIServer 使用官方 socket server，而不是自定义 TCP/HTTP
 type ABCIServer struct {
-	bridge    *Bridge
-	listener  net.Listener
-	mu        sync.Mutex
-	isRunning bool
+	bridge *Bridge
+	srv    interface {
+		Start() error
+		Stop() error
+	}
+	httpServer *http.Server
+	listenAddr string // e.g. "0.0.0.0:8080"
+	healthAddr string // e.g. "0.0.0.0:8081"
 }
 
-// NewABCIServer creates a new ABCI server
 func NewABCIServer(bridge *Bridge) *ABCIServer {
+	addr := "0.0.0.0:8080"
+	health := "0.0.0.0:8081"
+	if bridge.config != nil {
+		if bridge.config.Bridge.ListenAddr != "" {
+			addr = bridge.config.Bridge.ListenAddr
+		}
+		// 如果你有专门的健康检查端口配置，可在这里读取
+	}
 	return &ABCIServer{
-		bridge: bridge,
+		bridge:     bridge,
+		listenAddr: addr,
+		healthAddr: health,
 	}
 }
 
-// Start starts the ABCI server
 func (s *ABCIServer) Start() error {
-	addr := s.bridge.config.Bridge.ListenAddr
-	log.Printf("Starting gRPC ABCI server on %s", addr)
+	log.Printf("Starting ABCI socket server on %s", s.listenAddr)
 
-	var err error
-	// Create a TCP listener for the gRPC ABCI server
-	s.listener, err = net.Listen("tcp", addr)
+	// 你的业务 ABCI 应用（最小可用，下面实现了握手必要的方法）
+	app := NewABCIApp(s.bridge)
+
+	// 使用官方 socket server（"socket"），自动支持四条连接（query/snapshot/mempool/consensus）
+	srv, err := abciserver.NewServer(s.listenAddr, "socket", app)
 	if err != nil {
-		return fmt.Errorf("failed to listen on %s: %w", addr, err)
+		return fmt.Errorf("failed to create ABCI socket server on %s: %w", s.listenAddr, err)
 	}
+	s.srv = srv
 
-	s.isRunning = true
+	// 启动健康检查 HTTP（独立端口，避免与 ABCI socket 混淆）
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+	s.httpServer = &http.Server{
+		Addr:              s.healthAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 3 * time.Second,
+	}
+	go func() {
+		ln, err := net.Listen("tcp", s.healthAddr)
+		if err != nil {
+			log.Printf("health server listen error: %v", err)
+			return
+		}
+		log.Printf("Starting HTTP health check server on %s", s.healthAddr)
+		if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Printf("health server error: %v", err)
+		}
+	}()
 
-	// Handle connections
-	go s.acceptConnections()
-
-	// Also start a simple HTTP server for health checks
-	go s.startHTTPServer()
-
+	// 启动 ABCI socket
+	if err := s.srv.Start(); err != nil {
+		return fmt.Errorf("failed to start ABCI socket server: %w", err)
+	}
 	return nil
 }
 
-// Stop stops the ABCI server
 func (s *ABCIServer) Stop() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.listener != nil {
-		s.listener.Close()
+	if s.srv != nil {
+		_ = s.srv.Stop()
 	}
-	s.isRunning = false
-}
-
-// acceptConnections accepts and handles incoming ABCI connections
-func (s *ABCIServer) acceptConnections() {
-	for s.isRunning {
-		conn, err := s.listener.Accept()
-		if err != nil {
-			if s.isRunning {
-				log.Printf("Error accepting connection: %v", err)
-			}
-			return
-		}
-
-		log.Printf("Accepted ABCI connection from %s", conn.RemoteAddr().String())
-
-		// Handle the connection in a goroutine
-		go s.handleABCIConnection(conn)
+	if s.httpServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = s.httpServer.Shutdown(ctx)
 	}
 }
 
-// handleABCIConnection handles an ABCI connection using gRPC protocol
-func (s *ABCIServer) handleABCIConnection(conn net.Conn) {
-	defer conn.Close()
+/* ===================== 最小可用的 ABCI 应用 ===================== */
 
-	// In a real implementation, we would use the gRPC protocol here
-	// This is a simplified version that responds to ABCI requests
-	// with predefined responses to make CometBFT happy
-
-	buffer := make([]byte, 4096)
-
-	for {
-		n, err := conn.Read(buffer)
-		if err != nil {
-			log.Printf("Error reading from connection: %v", err)
-			return
-		}
-
-		// Here we should properly decode and handle the gRPC requests
-		// For now, we're just acknowledging receipt
-		log.Printf("Received %d bytes from ABCI client", n)
-
-		// Send a simple response
-		// In a real implementation, we would encode proper gRPC responses
-		response := []byte("OK\n")
-		_, err = conn.Write(response)
-		if err != nil {
-			log.Printf("Error writing to connection: %v", err)
-			return
-		}
-	}
+type ABCIApp struct {
+	abcitypes.BaseApplication // 提供默认实现，避免一次性实现所有方法
+	bridge                    *Bridge
 }
 
-// startHTTPServer starts a simple HTTP server for health checks
-func (s *ABCIServer) startHTTPServer() {
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	})
+func NewABCIApp(b *Bridge) *ABCIApp { return &ABCIApp{bridge: b} }
 
-	// Listen on a different port for HTTP
-	httpAddr := "0.0.0.0:8081"
-	log.Printf("Starting HTTP health check server on %s", httpAddr)
-	err := http.ListenAndServe(httpAddr, nil)
-	if err != nil {
-		log.Printf("HTTP server error: %v", err)
-	}
+// Echo：常用自检
+func (a *ABCIApp) Echo(ctx context.Context, req *abcitypes.RequestEcho) (*abcitypes.ResponseEcho, error) {
+	return &abcitypes.ResponseEcho{Message: req.Message}, nil
+}
+
+// Info：握手必须返回
+func (a *ABCIApp) Info(ctx context.Context, req *abcitypes.RequestInfo) (*abcitypes.ResponseInfo, error) {
+	return &abcitypes.ResponseInfo{
+		Version:         "ethbft-0.1.0",
+		AppVersion:      1,
+		LastBlockHeight: 0, // 初次启动为 0，后续可从持久化恢复
+		// LastBlockAppHash: 可按需填
+	}, nil
+}
+
+// InitChain：首次启动必须响应（可在此初始化状态/验证人等）
+func (a *ABCIApp) InitChain(ctx context.Context, req *abcitypes.RequestInitChain) (*abcitypes.ResponseInitChain, error) {
+	return &abcitypes.ResponseInitChain{}, nil
+}
+
+// 以下是最小化通过的实现；后续你可以把真实业务逻辑填进去
+func (a *ABCIApp) CheckTx(ctx context.Context, req *abcitypes.RequestCheckTx) (*abcitypes.ResponseCheckTx, error) {
+	return &abcitypes.ResponseCheckTx{Code: 0}, nil
+}
+func (a *ABCIApp) FinalizeBlock(ctx context.Context, req *abcitypes.RequestFinalizeBlock) (*abcitypes.ResponseFinalizeBlock, error) {
+	return &abcitypes.ResponseFinalizeBlock{}, nil
+}
+func (a *ABCIApp) Commit(ctx context.Context, req *abcitypes.RequestCommit) (*abcitypes.ResponseCommit, error) {
+	// TODO: 返回真实 app hash；先空返回也能让节点进入工作流
+	return &abcitypes.ResponseCommit{}, nil
 }
