@@ -242,12 +242,22 @@ func (c *Client) GetLatestBlock(ctx context.Context) (*types.Block, error) {
 
 	// Function to parse hex strings to big.Int
 	tryParseHexString := func(hexStr string) (*big.Int, error) {
+		// Handle empty or null values
+		if hexStr == "" || hexStr == "null" || hexStr == "0x" {
+			return big.NewInt(0), nil
+		}
+
 		// Clean up string - remove quotes, backslashes and other artifacts
 		s := strings.Trim(hexStr, "\"")
 		s = strings.ReplaceAll(s, "\\", "")
 
 		// Handle 0x prefix
 		s = strings.TrimPrefix(s, "0x")
+
+		// If string is empty after cleanup, return 0
+		if s == "" {
+			return big.NewInt(0), nil
+		}
 
 		// Convert to big.Int
 		n := new(big.Int)
@@ -259,6 +269,9 @@ func (c *Client) GetLatestBlock(ctx context.Context) (*types.Block, error) {
 		var str string
 		if err := json.Unmarshal([]byte(hexStr), &str); err == nil {
 			str = strings.TrimPrefix(str, "0x")
+			if str == "" {
+				return big.NewInt(0), nil
+			}
 			if _, success := n.SetString(str, 16); success {
 				return n, nil
 			}

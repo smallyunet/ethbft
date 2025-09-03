@@ -5,7 +5,6 @@ services:
     ports:
       - "8545:8545"   # HTTP RPC
       - "8546:8546"   # WebSocket RPC
-      - "8551:8551"   # Engine API
       - "30303:30303" # P2P
     volumes:
       - ./jwt.hex:/jwt.hex
@@ -18,18 +17,14 @@ services:
       - --http
       - --http.addr=0.0.0.0
       - --http.port=8545
-      - --http.api=eth,net,engine,admin
+      - --http.api=eth,net,web3,txpool,admin
       - --http.corsdomain=*
       - --http.vhosts=*
       - --ws
       - --ws.addr=0.0.0.0
       - --ws.port=8546
-      - --ws.api=eth,net,engine
+      - --ws.api=eth,net,web3,txpool
       - --ws.origins=*
-      - --authrpc.addr=0.0.0.0
-      - --authrpc.port=8551
-      - --authrpc.vhosts=*
-      - --authrpc.jwtsecret=/jwt.hex
       - --syncmode=full
       - --gcmode=archive
       - --txlookuplimit=0
@@ -42,12 +37,13 @@ services:
     container_name: ethbft-app
     ports:
       - "8080:8080" # ABCI socket
-      - "8081:8081" # Health check (your app should expose this)
+      - "8081:8081" # Health check
+      - "8551:8551" # Engine API server
     volumes:
-      - ./config/docker-config.json:/app/config.json
+      - ./config/docker-config.yaml:/app/config.yaml
       - ./jwt.hex:/app/jwt.hex
     environment:
-      - ETHBFT_CONFIG=/app/config.json
+      - ETHBFT_CONFIG=/app/config.yaml
     depends_on:
       - geth
     # Healthcheck ensures cometbft starts only after ethbft is ready

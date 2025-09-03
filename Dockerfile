@@ -27,7 +27,7 @@ RUN apk add --no-cache ca-certificates
 
 # Copy binary from builder stage
 COPY --from=builder /build/ethbft /app/ethbft
-COPY config/config.json /app/config.json
+COPY config/docker-config.yaml /app/config.yaml
 
 # Create a non-root user
 RUN adduser -D -g '' ethbft

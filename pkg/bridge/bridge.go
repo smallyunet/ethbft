@@ -9,24 +9,28 @@ import (
 
 	"github.com/smallyunet/ethbft/pkg/config"
 	"github.com/smallyunet/ethbft/pkg/consensus"
+	"github.com/smallyunet/ethbft/pkg/engine"
 	"github.com/smallyunet/ethbft/pkg/ethereum"
-	"github.com/smallyunet/ethbft/pkg/types"
+	"github.com/smallyunet/ethbft/pkg/state"
 )
 
 // Bridge is the main component that connects Ethereum execution clients with CometBFT consensus
 type Bridge struct {
-	config      *config.Config
-	ethClient   *ethereum.Client
-	consClient  *consensus.Client
-	abciServer  *ABCIServer
-	ctx         context.Context
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
-	running     bool
-	runningLock sync.Mutex
+	config       *config.Config
+	ethClient    *ethereum.Client
+	consClient   *consensus.Client
+	abciServer   *ABCIServer
+	engineServer *engine.Server
+	stateManager *state.Manager
+	abciApp      *ABCIApplication
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
+	running      bool
+	runningLock  sync.Mutex
 }
 
-// NewBridge creates a new bridge instance
+// NewBridge creates a new bridge instance with enhanced architecture
 func NewBridge(cfg *config.Config) (*Bridge, error) {
 	ethClient, err := ethereum.NewClient(cfg)
 	if err != nil {
@@ -40,21 +44,34 @@ func NewBridge(cfg *config.Config) (*Bridge, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// Create state manager
+	stateManager := state.NewManager(ethClient)
+
 	bridge := &Bridge{
-		config:     cfg,
-		ethClient:  ethClient,
-		consClient: consClient,
-		ctx:        ctx,
-		cancel:     cancel,
+		config:       cfg,
+		ethClient:    ethClient,
+		consClient:   consClient,
+		stateManager: stateManager,
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 
-	// Create the ABCI server
+	// Create enhanced ABCI application
+	bridge.abciApp = NewABCIApplication(bridge, stateManager)
+
+	// Create the ABCI server with enhanced app
 	bridge.abciServer = NewABCIServer(bridge)
+
+	// Create Engine API server
+	bridge.engineServer, err = engine.NewServer(cfg, bridge.abciApp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Engine API server: %w", err)
+	}
 
 	return bridge, nil
 }
 
-// Start starts the bridge
+// Start starts the bridge with new architecture
 func (b *Bridge) Start() error {
 	b.runningLock.Lock()
 	defer b.runningLock.Unlock()
@@ -63,18 +80,25 @@ func (b *Bridge) Start() error {
 		return fmt.Errorf("bridge is already running")
 	}
 
-	log.Println("Starting EthBFT bridge")
+	log.Println("Starting EthBFT bridge with enhanced architecture")
 
-	// Start the ABCI server first
+	// Start the Engine API server first
+	if err := b.engineServer.Start(); err != nil {
+		return fmt.Errorf("failed to start Engine API server: %w", err)
+	}
+
+	// Start the ABCI server
 	if err := b.abciServer.Start(); err != nil {
+		b.engineServer.Stop()
 		return fmt.Errorf("failed to start ABCI server: %w", err)
 	}
 
-	// Start the main processing loop in a goroutine
+	// Start connection monitoring (simplified, no more block pushing)
 	b.wg.Add(1)
-	go b.run()
+	go b.runConnectionMonitor()
 
 	b.running = true
+	log.Println("EthBFT bridge started successfully")
 	return nil
 }
 
@@ -89,8 +113,15 @@ func (b *Bridge) Stop() error {
 
 	log.Println("Stopping EthBFT bridge")
 
+	// Stop the Engine API server
+	if b.engineServer != nil {
+		b.engineServer.Stop()
+	}
+
 	// Stop the ABCI server
-	b.abciServer.Stop()
+	if b.abciServer != nil {
+		b.abciServer.Stop()
+	}
 
 	// Signal cancellation to all goroutines
 	b.cancel()
@@ -113,82 +144,24 @@ func (b *Bridge) Stop() error {
 	return nil
 }
 
-// run is the main processing loop
-func (b *Bridge) run() {
+// runConnectionMonitor monitors the connection status (simplified)
+func (b *Bridge) runConnectionMonitor() {
 	defer b.wg.Done()
 
-	normalInterval := time.Duration(b.config.Bridge.RetryInterval) * time.Second
-	reconnectInterval := 2 * time.Second // Faster reconnection interval
-
-	ticker := time.NewTicker(normalInterval)
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-
-	// Connection status variables
-	var connected bool = false
-	var consecutiveFailures int = 0
-
-	// Initial connection attempt
-	log.Println("Establishing initial connection to Ethereum and CometBFT...")
-
-	// Attempt to connect to both endpoints
-	if err := b.checkConnections(); err != nil {
-		log.Printf("Warning: %v. Will retry every %d seconds.", err, b.config.Bridge.RetryInterval)
-		connected = false
-		// Immediately switch to fast reconnection mode
-		ticker.Reset(reconnectInterval)
-	} else {
-		log.Println("Successfully connected to Ethereum and CometBFT endpoints")
-		connected = true
-	}
 
 	for {
 		select {
 		case <-b.ctx.Done():
-			log.Println("Bridge processing loop terminated")
+			log.Println("Connection monitor stopped")
 			return
 		case <-ticker.C:
-			if !connected {
-				// If disconnected, try to reconnect
-				log.Println("Attempting to reconnect to services...")
-				if err := b.checkConnections(); err != nil {
-					consecutiveFailures++
-					log.Printf("Connection failed (%d consecutive failures): %v", consecutiveFailures, err)
-
-					// If too many failures, increase log verbosity
-					if consecutiveFailures > 5 {
-						log.Printf("Connection details - Ethereum endpoint: %s, Engine API: %s, CometBFT endpoint: %s",
-							b.config.Ethereum.Endpoint,
-							b.config.Ethereum.EngineAPI,
-							b.config.CometBFT.Endpoint)
-					}
-
-					// Maintain fast reconnection mode
-					ticker.Reset(reconnectInterval)
-				} else {
-					log.Println("Reconnection successful! Resuming normal processing.")
-					connected = true
-					consecutiveFailures = 0
-					ticker.Reset(normalInterval)
-				}
+			// Just log the status periodically
+			if err := b.checkConnections(); err != nil {
+				log.Printf("Connection check failed: %v", err)
 			} else {
-				// Normal block processing
-				if err := b.processNextBlock(); err != nil {
-					log.Printf("Error processing block: %v", err)
-					consecutiveFailures++
-
-					// Check if it's a connection issue
-					if consecutiveFailures > 3 {
-						log.Println("Multiple consecutive failures detected, checking connection status...")
-						if connErr := b.checkConnections(); connErr != nil {
-							log.Printf("Connection lost: %v", connErr)
-							connected = false
-							ticker.Reset(reconnectInterval)
-						}
-					}
-				} else {
-					// Successfully processed block, reset failure counter
-					consecutiveFailures = 0
-				}
+				log.Println("All services are connected and healthy")
 			}
 		}
 	}
@@ -242,36 +215,5 @@ func (b *Bridge) checkConnections() error {
 			b.config.CometBFT.Endpoint, cometErr)
 	}
 
-	return nil
-}
-
-// processNextBlock processes the next block from Ethereum and proposes it to CometBFT
-func (b *Bridge) processNextBlock() error {
-	ctx, cancel := context.WithTimeout(b.ctx, 5*time.Second)
-	defer cancel()
-
-	// Get the latest block from Ethereum
-	block, err := b.ethClient.GetLatestBlock(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get latest block: %w", err)
-	}
-
-	// Convert the block to CometBFT consensus data
-	consensusData := &types.ConsensusData{
-		BlockHash:       block.Hash,
-		BlockNumber:     block.Number.Int64(),
-		ParentHash:      block.ParentHash,
-		StateRoot:       block.StateRoot,
-		ReceiptsRoot:    block.ReceiptsRoot,
-		TransactionRoot: block.TransactionsRoot,
-		Timestamp:       block.Timestamp.Int64(),
-	}
-
-	// Propose the block to CometBFT
-	if err := b.consClient.ProposeBlock(ctx, consensusData); err != nil {
-		return fmt.Errorf("failed to propose block to CometBFT: %w", err)
-	}
-
-	log.Printf("Successfully processed block %d (%s)", block.Number.Int64(), block.Hash)
 	return nil
 }

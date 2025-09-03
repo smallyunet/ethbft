@@ -72,12 +72,12 @@ make run
 
 ## Configuration
 
-EthBFT can be configured using a JSON configuration file. A sample configuration file is provided in `config/config.json`.
+EthBFT can be configured using a YAML configuration file. A sample configuration file is provided in `config/config.yaml`.
 
 You can also set the configuration file path using the `ETHBFT_CONFIG` environment variable:
 
 ```bash
-ETHBFT_CONFIG=/path/to/config.json ./ethbft
+ETHBFT_CONFIG=/path/to/config.yaml ./ethbft
 ```
 
 Key configuration options:

@@ -19,7 +19,7 @@ vendor/
 jwt.hex
 
 # Local config
-/config.json
+/config.yaml
 
 # Data directories
 geth_data/

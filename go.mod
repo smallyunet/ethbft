@@ -4,7 +4,10 @@ go 1.23.5
 
 toolchain go1.24.6
 
-require github.com/cometbft/cometbft v0.38.0
+require (
+	github.com/cometbft/cometbft v0.38.0
+	gopkg.in/yaml.v3 v3.0.1
+)
 
 require (
 	github.com/btcsuite/btcd/btcec/v2 v2.3.2 // indirect

@@ -70,5 +70,5 @@ rebuild: docker-rebuild
 
 # Development setup
 dev-setup: deps generate-jwt create-genesis
-	cp config/config.json ./
+	cp config/config.yaml ./
 	@echo "Development setup complete"

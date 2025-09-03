@@ -1,0 +1,13 @@
+ethereum:
+  endpoint: "http://geth:8545"
+  engineAPI: "http://geth:8551"
+  jwtSecret: "/app/jwt.hex"
+
+cometbft:
+  endpoint: "http://cometbft:26657"
+  homeDir: "/app/cometbft_home"
+
+bridge:
+  listenAddr: "0.0.0.0:8080"
+  logLevel: "info"
+  retryInterval: 5
