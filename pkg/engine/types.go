@@ -30,6 +30,11 @@ type ExecutionPayload struct {
 	BaseFeePerGas string   `json:"baseFeePerGas"`
 	BlockHash     string   `json:"blockHash"`
 	Transactions  []string `json:"transactions"`
+	// Deneb additions
+	Withdrawals           []string `json:"withdrawals,omitempty"`
+	BlobGasUsed           string   `json:"blobGasUsed,omitempty"`
+	ExcessBlobGas         string   `json:"excessBlobGas,omitempty"`
+	ParentBeaconBlockRoot string   `json:"parentBeaconBlockRoot,omitempty"`
 }
 
 // ForkchoiceState represents the forkchoice state

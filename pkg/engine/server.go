@@ -35,6 +35,9 @@ type Server struct {
 	slotRoots         map[int64]string              // slot -> header root
 	rootSlots         map[string]int64              // header root -> slot
 	headerData        map[string]beaconHeaderFields // header root -> fields
+	payloadsBySlot    map[int64]*ExecutionPayload   // slot -> execution payload used for body root
+	blockSSZByRoot    map[string][]byte             // header root -> persisted SSZ bytes (only trusted source)
+	blockJSONByRoot   map[string][]byte             // header root -> pre-built beacon block JSON response (stable)
 	blockMutex        sync.RWMutex
 
 	// Event stream clients
@@ -64,10 +67,13 @@ func NewServer(cfg *config.Config, abciClient ABCIClient) (*Server, error) {
 			SafeBlockHash:      "0x0000000000000000000000000000000000000000000000000000000000000000",
 			FinalizedBlockHash: "0x0000000000000000000000000000000000000000000000000000000000000000",
 		},
-		eventClients: make(map[chan []byte]bool),
-		slotRoots:    make(map[int64]string),
-		rootSlots:    make(map[string]int64),
-		headerData:   make(map[string]beaconHeaderFields),
+		eventClients:    make(map[chan []byte]bool),
+		slotRoots:       make(map[int64]string),
+		rootSlots:       make(map[string]int64),
+		headerData:      make(map[string]beaconHeaderFields),
+		payloadsBySlot:  make(map[int64]*ExecutionPayload),
+		blockSSZByRoot:  make(map[string][]byte),
+		blockJSONByRoot: make(map[string][]byte),
 	}
 
 	// Start block monitoring
@@ -90,6 +96,29 @@ func NewServer(cfg *config.Config, abciClient ABCIClient) (*Server, error) {
 	}()
 
 	return server, nil
+}
+
+// storeRootToBytes stores SSZ bytes for a beacon block root (only trusted source)
+func (s *Server) storeRootToBytes(root string, sszBytes []byte) {
+	s.blockMutex.Lock()
+	defer s.blockMutex.Unlock()
+	s.blockSSZByRoot[root] = sszBytes
+}
+
+// storeSlotToRoot stores slot to root mapping
+func (s *Server) storeSlotToRoot(slot int64, root string) {
+	s.blockMutex.Lock()
+	defer s.blockMutex.Unlock()
+	s.slotRoots[slot] = root
+	s.rootSlots[root] = slot
+}
+
+// loadBytesByRoot loads SSZ bytes by beacon block root
+func (s *Server) loadBytesByRoot(root string) ([]byte, bool) {
+	s.blockMutex.RLock()
+	defer s.blockMutex.RUnlock()
+	sszBytes, ok := s.blockSSZByRoot[root]
+	return sszBytes, ok
 }
 
 // Start starts the Engine API server
@@ -240,18 +269,48 @@ func (s *Server) monitorBlocks() {
 		if s.headRoot != "" {
 			parent = s.headRoot
 		}
-		bodyRoot := computeBeaconBodyRootWithStateRoot(&ExecutionPayload{StateRoot: stateRoot})
-		hdr := beaconHeaderFields{ // initial head header
-			Slot:       height,
-			ParentRoot: parent,
-			StateRoot:  s.latestBlockHash,
-			BodyRoot:   bodyRoot,
+		// Use CometBFT block hash as execution block hash (non-zero) for payload block_hash field
+		// Static mainnet genesis execution payload (slot-aligned synthetic) per user instruction
+		initialPayload := &ExecutionPayload{
+			ParentHash:            zeroHash32(),
+			FeeRecipient:          zeroHexBytes(20),
+			StateRoot:             "0xd7f8974fb5ac78d9ac099b9ad5018bedc2ce0a72dad1827a1709da30580f0544",
+			ReceiptsRoot:          "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+			LogsBloom:             zeroBloom256(),
+			PrevRandao:            zeroHash32(),
+			BlockNumber:           "0x0",
+			GasLimit:              "0x1388",
+			GasUsed:               "0x0",
+			Timestamp:             "0x0",
+			ExtraData:             "0x11bbe8db4e347b4e8c937c1c8370e4b5ed33adb3db69cbdb7a38e1e50b1b82fa",
+			BaseFeePerGas:         "0x0",
+			BlockHash:             "0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3",
+			Transactions:          []string{},
+			Withdrawals:           []string{},
+			BlobGasUsed:           "0x0",
+			ExcessBlobGas:         "0x0",
+			ParentBeaconBlockRoot: zeroHash32(),
 		}
-		root := computeBeaconHeaderRoot(hdr)
+		bodyRoot := computeBeaconBodyRootWithStateRoot(initialPayload)
+		blk := &SignedBeaconBlock{Message: &BeaconBlock{Slot: uint64(height), ProposerIndex: 0, ParentRoot: parent, StateRoot: s.latestBlockHash, Body: &BeaconBlockBody{ExecutionPayload: initialPayload}}}
+
+		// Store SSZ bytes and root mapping (only trust SSZ bytes, not objects)
+		sszBytes := marshalSignedBeaconBlockSSZ(blk)
+		root := computeSignedBeaconBlockRoot(blk)
+		s.storeRootToBytes(root, sszBytes)
+		s.storeSlotToRoot(height, root)
+
+		// Legacy storage for compatibility (will be removed)
+		hdr := beaconHeaderFields{Slot: height, ParentRoot: parent, StateRoot: s.latestBlockHash, BodyRoot: bodyRoot}
 		s.headRoot = root
-		s.slotRoots[height] = root
-		s.rootSlots[root] = height
 		s.headerData[root] = hdr
+		s.payloadsBySlot[height] = initialPayload
+		s.blockJSONByRoot[root] = buildBeaconBlockJSON(hdr, initialPayload)
+		// Verify creation consistency
+		verifyBody := computeBeaconBodyRootWithStateRoot(initialPayload)
+		if verifyBody != bodyRoot {
+			log.Printf("BODY_ROOT_INIT_MISMATCH slot=%d stored=%s recomputed=%s", height, bodyRoot, verifyBody)
+		}
 		s.blockMutex.Unlock()
 	}
 
@@ -288,14 +347,54 @@ func (s *Server) monitorBlocks() {
 			if parent == "" {
 				parent = zeroHash32()
 			}
-			bodyRoot := computeBeaconBodyRootWithStateRoot(&ExecutionPayload{StateRoot: stateRoot})
-			hdr := beaconHeaderFields{
-				Slot:       h,
-				ParentRoot: parent,
-				StateRoot:  s.latestBlockHash,
-				BodyRoot:   bodyRoot,
+			// Reuse existing deterministic payload if present (slot should not change contents after first creation)
+			var payloadForSlot *ExecutionPayload
+			if p, ok := s.payloadsBySlot[h]; ok {
+				payloadForSlot = p
+			} else {
+				// Reuse the static genesis execution payload for all subsequent slots (demo mode)
+				payloadForSlot = &ExecutionPayload{
+					ParentHash:            zeroHash32(),
+					FeeRecipient:          zeroHexBytes(20),
+					StateRoot:             "0xd7f8974fb5ac78d9ac099b9ad5018bedc2ce0a72dad1827a1709da30580f0544",
+					ReceiptsRoot:          "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+					LogsBloom:             zeroBloom256(),
+					PrevRandao:            zeroHash32(),
+					BlockNumber:           "0x0",
+					GasLimit:              "0x1388",
+					GasUsed:               "0x0",
+					Timestamp:             "0x0",
+					ExtraData:             "0x11bbe8db4e347b4e8c937c1c8370e4b5ed33adb3db69cbdb7a38e1e50b1b82fa",
+					BaseFeePerGas:         "0x0",
+					BlockHash:             "0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3",
+					Transactions:          []string{},
+					Withdrawals:           []string{},
+					BlobGasUsed:           "0x0",
+					ExcessBlobGas:         "0x0",
+					ParentBeaconBlockRoot: zeroHash32(),
+				}
+				s.payloadsBySlot[h] = payloadForSlot
 			}
-			newRoot := computeBeaconHeaderRoot(hdr)
+			bodyRoot := computeBeaconBodyRootWithStateRoot(payloadForSlot)
+			blk := &SignedBeaconBlock{Message: &BeaconBlock{Slot: uint64(h), ProposerIndex: 0, ParentRoot: parent, StateRoot: s.latestBlockHash, Body: &BeaconBlockBody{ExecutionPayload: payloadForSlot}}}
+
+			// Store SSZ bytes and root mapping (only trust SSZ bytes, not objects)
+			sszBytes := marshalSignedBeaconBlockSSZ(blk)
+			newRoot := computeSignedBeaconBlockRoot(blk)
+			s.storeRootToBytes(newRoot, sszBytes)
+			s.storeSlotToRoot(h, newRoot)
+
+			// Verify recomputation stability
+			if recompute := computeBeaconBodyRootWithStateRoot(payloadForSlot); recompute != bodyRoot {
+				log.Printf("BODY_ROOT_DRIFT slot=%d bodyRoot=%s recompute=%s", h, bodyRoot, recompute)
+			}
+
+			// Legacy storage for compatibility (will be removed)
+			hdr := beaconHeaderFields{Slot: h, ParentRoot: parent, StateRoot: s.latestBlockHash, BodyRoot: bodyRoot}
+			s.headRoot = newRoot
+			s.headerData[newRoot] = hdr
+			s.blockJSONByRoot[newRoot] = buildBeaconBlockJSON(hdr, payloadForSlot)
+
 			if true { // verbose chunk debug (spec header chunks expected=4 for Deneb)
 				chunks := computeBeaconHeaderLeaves(hdr)
 				if len(chunks) == 4 {
@@ -313,11 +412,6 @@ func (s *Server) monitorBlocks() {
 			log.Printf("BLOCK_PROCESS:   - body_root: %s", bodyRoot)
 			log.Printf("BLOCK_PROCESS:   - computed_beacon_root: %s", newRoot)
 			log.Printf("BLOCK_PROCESS: This beacon root will be used when Geth requests beacon block data")
-
-			s.headRoot = newRoot
-			s.slotRoots[h] = newRoot
-			s.rootSlots[newRoot] = h
-			s.headerData[newRoot] = hdr
 			s.blockMutex.Unlock()
 			log.Printf("New block: height=%d headerRoot=%s execHash=%s", h, s.headRoot, s.latestBlockHash)
 			s.broadcastHeadEvent(h, s.headRoot)
@@ -364,6 +458,67 @@ func loadJWTSecret(path string) (string, error) {
 	}
 
 	return secret, nil
+}
+
+// buildBeaconBlockJSON constructs a stable beacon block JSON (Deneb) from stored header & payload.
+// It returns the serialized bytes to be served directly by handlers to avoid any 'latest' lookups.
+func buildBeaconBlockJSON(hdr beaconHeaderFields, payload *ExecutionPayload) []byte {
+	txList := make([]interface{}, 0)
+	withdrawals := make([]interface{}, 0)
+	resp := map[string]interface{}{
+		"version": "deneb",
+		"data": map[string]interface{}{
+			"message": map[string]interface{}{
+				"slot":           fmt.Sprintf("%d", hdr.Slot),
+				"proposer_index": "0",
+				"parent_root":    hdr.ParentRoot,
+				"state_root":     hdr.StateRoot,
+				"body_root":      hdr.BodyRoot,
+				"body": map[string]interface{}{
+					"randao_reveal": zeroSig96(),
+					"eth1_data": map[string]interface{}{
+						"deposit_root":  zeroHash32(),
+						"deposit_count": "0",
+						"block_hash":    zeroHash32(),
+					},
+					"graffiti":           zeroHash32(),
+					"proposer_slashings": []interface{}{},
+					"attester_slashings": []interface{}{},
+					"attestations":       []interface{}{},
+					"deposits":           []interface{}{},
+					"voluntary_exits":    []interface{}{},
+					"sync_aggregate": map[string]interface{}{
+						"sync_committee_bits":      zeroHexBytes(64),
+						"sync_committee_signature": zeroSig96(),
+					},
+					"execution_payload": map[string]interface{}{
+						"parent_hash":              payload.ParentHash,
+						"fee_recipient":            payload.FeeRecipient,
+						"state_root":               payload.StateRoot,
+						"receipts_root":            payload.ReceiptsRoot,
+						"logs_bloom":               payload.LogsBloom,
+						"prev_randao":              payload.PrevRandao,
+						"block_number":             payload.BlockNumber,
+						"gas_limit":                payload.GasLimit,
+						"gas_used":                 payload.GasUsed,
+						"timestamp":                payload.Timestamp,
+						"extra_data":               payload.ExtraData,
+						"base_fee_per_gas":         payload.BaseFeePerGas,
+						"block_hash":               payload.BlockHash,
+						"transactions":             txList,
+						"withdrawals":              withdrawals,
+						"blob_gas_used":            payload.BlobGasUsed,
+						"excess_blob_gas":          payload.ExcessBlobGas,
+						"parent_beacon_block_root": payload.ParentBeaconBlockRoot,
+					},
+					"blob_kzg_commitments": []interface{}{},
+				},
+			},
+			"signature": zeroSig96(),
+		},
+	}
+	bytes, _ := json.Marshal(resp)
+	return bytes
 }
 
 // verifyJWT verifies the JWT token in the request

@@ -1,14 +1,12 @@
 package engine
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // Beacon API handlers
@@ -134,6 +132,9 @@ func (s *Server) handleBeaconBlock(w http.ResponseWriter, r *http.Request) {
 	}
 	id := parts[len(parts)-1]
 
+	// Log the incoming request for debugging
+	log.Printf("BEACON_REQUEST: handleBeaconBlock called with ID: %s", id)
+
 	var (
 		root  string
 		found bool
@@ -143,75 +144,111 @@ func (s *Server) handleBeaconBlock(w http.ResponseWriter, r *http.Request) {
 	if id == "head" {
 		root = s.headRoot
 		found = true
+		log.Printf("BEACON_REQUEST: Request for 'head', using root: %s", root)
 	} else if strings.HasPrefix(id, "0x") {
-		if _, ok := s.rootSlots[normalizeRoot(id)]; ok {
-			root = normalizeRoot(id)
+		normalizedId := normalizeRoot(id)
+		if _, ok := s.rootSlots[normalizedId]; ok {
+			root = normalizedId
 			found = true
+			log.Printf("BEACON_REQUEST: Found root %s in rootSlots mapping", root)
+		} else {
+			log.Printf("BEACON_REQUEST: Root %s NOT found in rootSlots mapping", normalizedId)
+			// Print current rootSlots for debugging
+			log.Printf("BEACON_REQUEST: Current rootSlots mappings:")
+			for r, sl := range s.rootSlots {
+				log.Printf("BEACON_REQUEST:   %s -> slot %d", r, sl)
+			}
 		}
 	} else if n, err := strconv.ParseInt(id, 10, 64); err == nil {
 		if rt, ok := s.slotRoots[n]; ok {
 			root = rt
 			found = true
+			log.Printf("BEACON_REQUEST: Found slot %d -> root %s", n, root)
+		} else {
+			log.Printf("BEACON_REQUEST: Slot %d NOT found in slotRoots mapping", n)
 		}
 	}
 	s.blockMutex.RUnlock()
 
 	if !found {
+		log.Printf("BEACON_REQUEST: Block not found for ID: %s", id)
 		http.Error(w, "Block not found", http.StatusNotFound)
 		return
 	}
 
 	hdrFields, ok := s.headerData[root]
 	if !ok {
-		// When header data is not found, try to rebuild it from current state
-		// This prevents hash mismatch errors when GETH requests a beacon block by hash
-		log.Printf("WARNING: Header data not found for root %s, attempting to rebuild", root)
-
-		// Try to find the slot from rootSlots mapping
-		var slot int64
-		if sl, exists := s.rootSlots[root]; exists {
-			slot = sl
-		} else {
-			log.Printf("ERROR: Could not find slot for root %s", root)
+		// Use SSZ bytes as the only trusted source - never reconstruct from "latest"
+		sszBytes, sszOk := s.loadBytesByRoot(root)
+		if !sszOk {
+			log.Printf("ERROR: No SSZ bytes found for root %s", root)
 			http.Error(w, "Beacon block not found", http.StatusNotFound)
 			return
 		}
 
-		// Try to rebuild the header data
-		s.blockMutex.RLock()
-		execStateRoot := s.latestBlockHash
-		parentRoot := "0x0000000000000000000000000000000000000000000000000000000000000000"
-		if slot > 0 {
-			// Try to find parent from previous slot
-			if prevRoot, exists := s.slotRoots[slot-1]; exists {
-				parentRoot = prevRoot
-			}
-		}
-		s.blockMutex.RUnlock()
-
-		bodyRoot := computeBeaconBodyRootWithStateRoot(&ExecutionPayload{StateRoot: execStateRoot})
-		hdrFields = beaconHeaderFields{
-			Slot:       slot,
-			ParentRoot: parentRoot,
-			StateRoot:  execStateRoot,
-			BodyRoot:   bodyRoot,
-		}
-
-		// Verify that the rebuilt header produces the expected root
-		rebuiltRoot := computeBeaconHeaderRoot(hdrFields)
-		if rebuiltRoot != root {
-			log.Printf("ERROR: Rebuilt header root %s does not match expected root %s", rebuiltRoot, root)
-			http.Error(w, "Beacon block root mismatch", http.StatusNotFound)
+		// Unmarshal ONLY for extracting header fields
+		blk, err := unmarshalSignedBeaconBlockSSZ(sszBytes)
+		if err != nil {
+			log.Printf("ERROR: Failed to unmarshal SSZ for root %s: %v", root, err)
+			http.Error(w, "Corrupt beacon block", http.StatusInternalServerError)
 			return
 		}
 
-		// Store the rebuilt header data for future use
+		// Extract header fields from unmarshaled block
+		bodyRoot := computeBeaconBodyRootSpec(blk.Message.Body.ExecutionPayload)
+		hdrFields = beaconHeaderFields{
+			Slot:       int64(blk.Message.Slot),
+			ParentRoot: blk.Message.ParentRoot,
+			StateRoot:  blk.Message.StateRoot,
+			BodyRoot:   bodyRoot,
+		}
+
+		// Verify consistency
+		rebuiltRoot := computeBeaconHeaderRoot(hdrFields)
+		if rebuiltRoot != root {
+			log.Printf("ERROR: Header root mismatch for %s: expected %s, got %s", root, root, rebuiltRoot)
+			http.Error(w, "Beacon block root mismatch", http.StatusInternalServerError)
+			return
+		}
+
+		// Cache for future use
 		s.blockMutex.Lock()
 		s.headerData[root] = hdrFields
 		s.blockMutex.Unlock()
 
-		log.Printf("Successfully rebuilt header data for root %s", root)
+		log.Printf("Successfully extracted header data from SSZ for root %s", root)
 	}
+
+	// For hard self-check, we need to get the SSZ bytes and unmarshal the block
+	sszBytes, sszOk := s.loadBytesByRoot(root)
+	if !sszOk {
+		log.Printf("ERROR: No SSZ bytes found for hard self-check, root %s", root)
+		http.Error(w, "Beacon block not found", http.StatusInternalServerError)
+		return
+	}
+
+	// Unmarshal for hard self-check validation
+	blk, err := unmarshalSignedBeaconBlockSSZ(sszBytes)
+	if err != nil {
+		log.Printf("ERROR: Failed to unmarshal SSZ for hard self-check, root %s: %v", root, err)
+		http.Error(w, "Corrupt beacon block", http.StatusInternalServerError)
+		return
+	}
+
+	// HARD SELF-CHECK: Validate body root before returning response
+	if err := hardSelfCheckBeaconBlockBody(blk, hdrFields.BodyRoot); err != nil {
+		log.Printf("CRITICAL: %v", err)
+		http.Error(w, "body_root mismatch", http.StatusInternalServerError)
+		return
+	}
+
+	// HARD SELF-CHECK: Validate full block root before returning response
+	if err := hardSelfCheckBeaconBlock(blk, root); err != nil {
+		log.Printf("CRITICAL: %v", err)
+		http.Error(w, "block_root mismatch", http.StatusInternalServerError)
+		return
+	}
+
 	resp := map[string]interface{}{
 		"data": map[string]interface{}{
 			"message": map[string]interface{}{
@@ -283,7 +320,23 @@ func (s *Server) handleBeaconHeader(w http.ResponseWriter, r *http.Request) {
 		s.blockMutex.RLock()
 		execStateRoot := s.latestBlockHash // This should be the execution state root
 		s.blockMutex.RUnlock()
-		hdrFields2 = beaconHeaderFields{Slot: slot, ParentRoot: zeroHash32(), StateRoot: execStateRoot, BodyRoot: zeroHash32()}
+		bodyRoot := computeBeaconBodyRootWithStateRoot(&ExecutionPayload{
+			StateRoot:     execStateRoot,
+			BlockNumber:   fmt.Sprintf("0x%x", slot),
+			Timestamp:     "0x0",
+			ParentHash:    "0x0000000000000000000000000000000000000000000000000000000000000000",
+			FeeRecipient:  "0x0000000000000000000000000000000000000000",
+			ReceiptsRoot:  "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+			LogsBloom:     "0x" + strings.Repeat("0", 512),
+			PrevRandao:    "0x0000000000000000000000000000000000000000000000000000000000000000",
+			GasLimit:      "0x1388",
+			GasUsed:       "0x0",
+			ExtraData:     "0x",
+			BaseFeePerGas: "0x0",
+			BlockHash:     "0x0000000000000000000000000000000000000000000000000000000000000000",
+			Transactions:  []string{},
+		})
+		hdrFields2 = beaconHeaderFields{Slot: slot, ParentRoot: zeroHash32(), StateRoot: execStateRoot, BodyRoot: bodyRoot}
 		log.Printf("WARNING: Header data not found for root %s in handleBeaconHeader, using fallback with execStateRoot %s", root, execStateRoot)
 	}
 	resp := map[string]interface{}{
@@ -369,74 +422,59 @@ func (s *Server) handleBeaconBlockV2(w http.ResponseWriter, r *http.Request) {
 	}
 	s.blockMutex.Unlock()
 
-	// Generate consistent timestamp for both SSZ calculation and JSON response
-	currentTimestamp := uint64(time.Now().Unix())
-
-	// Try to get the actual execution payload from Geth for accurate beacon block body
-	var actualPayload *ExecutionPayload
-	if payload, err := s.abciClient.GetPendingPayload(context.Background()); err == nil {
-		actualPayload = payload
-		log.Printf("DEBUG: Got actual execution payload for JSON response: parentHash=%s, stateRoot=%s, blockNumber=%s",
-			payload.ParentHash, payload.StateRoot, payload.BlockNumber)
-	} else {
-		log.Printf("WARNING: Could not get execution payload for JSON response: %v", err)
-	}
-
-	hdrFields3, ok := s.headerData[root]
+	// Retrieve stored SSZ bytes (only trusted source)
+	sszBytes, ok := s.loadBytesByRoot(root)
 	if !ok {
-		// When header data is not found, use the latest execution state root instead of the beacon header root
-		s.blockMutex.RLock()
-		execStateRoot := s.latestBlockHash // This should be the execution state root
-		s.blockMutex.RUnlock()
-
-		// Calculate the correct body root with the actual execution payload data
-		var bodyRoot string
-		if actualPayload != nil {
-			// Use the COMPLETE execution payload for body root calculation to match JSON response
-			bodyRoot = computeBeaconBodyRootWithRealPayload(actualPayload)
-			log.Printf("BODY_ROOT_CALC: Using complete execution payload for SSZ calculation (fallback)")
-		} else {
-			// Fallback to using the simple state root method
-			bodyRoot = computeBeaconBodyRootWithStateRoot(&ExecutionPayload{StateRoot: execStateRoot})
-			log.Printf("BODY_ROOT_CALC: Using fallback method (no execution payload)")
-		}
-
-		hdrFields3 = beaconHeaderFields{Slot: slot, ParentRoot: zeroHash32(), StateRoot: execStateRoot, BodyRoot: bodyRoot}
-		log.Printf("WARNING: Header data not found for root %s, using fallback with execStateRoot %s, bodyRoot %s", root, execStateRoot, bodyRoot)
-	} else {
-		// CRITICAL: Do NOT recalculate body root when serving beacon blocks
-		// The body root must remain exactly as it was when the beacon block root was originally computed
-		// Any changes to body root will cause beacon block root mismatch errors from geth
-		log.Printf("BODY_ROOT_CALC: Using existing body root (no recalculation): %s", hdrFields3.BodyRoot)
+		log.Printf("BLOCK_NOT_FOUND: no stored SSZ for root %s", root)
+		http.Error(w, "Block not found", http.StatusNotFound)
+		return
 	}
 
-	// Debug: log the state root being used in the beacon block
-	log.Printf("DEBUG: BeaconBlockV2 using StateRoot: %s, BodyRoot: %s for root %s", hdrFields3.StateRoot, hdrFields3.BodyRoot, root)
-
-	// CRITICAL: Recalculate beacon block root based on the header fields we're actually returning
-	actualBeaconRoot := computeBeaconHeaderRoot(hdrFields3)
-
-	// Debug: log the final beacon block response that will be sent to Geth
-	log.Printf("BEACON_RESPONSE: Returning beacon block for slot %d with:", hdrFields3.Slot)
-	log.Printf("BEACON_RESPONSE:   - slot: %d", hdrFields3.Slot)
-	log.Printf("BEACON_RESPONSE:   - parent_root: %s", hdrFields3.ParentRoot)
-	log.Printf("BEACON_RESPONSE:   - state_root: %s", hdrFields3.StateRoot)
-	log.Printf("BEACON_RESPONSE:   - body_root: %s", hdrFields3.BodyRoot)
-	log.Printf("BEACON_RESPONSE:   - beacon_block_root (stored): %s", root)
-	log.Printf("BEACON_RESPONSE:   - beacon_block_root (recalculated): %s", actualBeaconRoot)
-	if root != actualBeaconRoot {
-		log.Printf("BEACON_RESPONSE: WARNING - Root mismatch! Stored: %s, Calculated: %s", root, actualBeaconRoot)
+	// Unmarshal ONLY for self-check and JSON conversion
+	blk, err := unmarshalSignedBeaconBlockSSZ(sszBytes)
+	if err != nil {
+		log.Printf("UNMARSHAL_ERROR: root=%s err=%v", root, err)
+		http.Error(w, "corrupt block", http.StatusInternalServerError)
+		return
 	}
 
+	// Self-check A: body_root
+	bodyRoot := computeBeaconBodyRootSpec(blk.Message.Body.ExecutionPayload)
+	// Header root recompute & compare (block root)
+	recalcRoot := computeSignedBeaconBlockRoot(blk)
+	if recalcRoot != root {
+		log.Printf("BLOCK_ROOT_MISMATCH param=%s recalc=%s", root, recalcRoot)
+		http.Error(w, "block_root mismatch", http.StatusInternalServerError)
+		return
+	}
+
+	// Log per-field roots (compute function already prints execution & body field roots)
+	logBlockFieldRoots(blk, root)
+
+	// HARD SELF-CHECK: Validate body root before returning response
+	if err := hardSelfCheckBeaconBlockBody(blk, bodyRoot); err != nil {
+		log.Printf("CRITICAL: %v", err)
+		http.Error(w, "body_root mismatch", http.StatusInternalServerError)
+		return
+	}
+
+	// HARD SELF-CHECK: Validate full block root before returning response
+	if err := hardSelfCheckBeaconBlock(blk, root); err != nil {
+		log.Printf("CRITICAL: %v", err)
+		http.Error(w, "block_root mismatch", http.StatusInternalServerError)
+		return
+	}
+
+	// Build JSON strictly from blk (no latest lookups)
 	resp := map[string]interface{}{
-		"version": "deneb", // Critical field specifying the fork version
+		"version": "deneb",
 		"data": map[string]interface{}{
 			"message": map[string]interface{}{
-				"slot":           strconv.FormatInt(hdrFields3.Slot, 10),
-				"proposer_index": "0",
-				"parent_root":    hdrFields3.ParentRoot,
-				"state_root":     hdrFields3.StateRoot,
-				"body_root":      hdrFields3.BodyRoot, // Critical: beacon header must include body_root for hash calculation
+				"slot":           fmt.Sprintf("%d", blk.Message.Slot),
+				"proposer_index": fmt.Sprintf("%d", blk.Message.ProposerIndex),
+				"parent_root":    blk.Message.ParentRoot,
+				"state_root":     blk.Message.StateRoot,
+				"body_root":      bodyRoot,
 				"body": map[string]interface{}{
 					"randao_reveal": zeroSig96(),
 					"eth1_data": map[string]interface{}{
@@ -450,37 +488,30 @@ func (s *Server) handleBeaconBlockV2(w http.ResponseWriter, r *http.Request) {
 					"attestations":       []interface{}{},
 					"deposits":           []interface{}{},
 					"voluntary_exits":    []interface{}{},
-
-					// Required since Altair fork
 					"sync_aggregate": map[string]interface{}{
-						"sync_committee_bits":      zeroHexBytes(64), // 512 bits
+						"sync_committee_bits":      zeroHexBytes(64),
 						"sync_committee_signature": zeroSig96(),
 					},
-
-					// Required for Deneb: execution_payload structure must match the data used for body_root calculation
-					// CRITICAL: Use consistent data structure that matches our SSZ body_root calculation
 					"execution_payload": map[string]interface{}{
-						"parent_hash":              zeroHash32(),
-						"fee_recipient":            zeroHexBytes(20),                                                     // address
-						"state_root":               hdrFields3.StateRoot,                                                 // Must match the state_root used in body_root calculation
-						"receipts_root":            "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421", // Empty tree root
-						"logs_bloom":               zeroBloom256(),                                                       // 256 bytes
-						"prev_randao":              zeroHash32(),
-						"block_number":             fmt.Sprintf("0x%x", slot),             // Use actual slot as block number
-						"gas_limit":                "0x1388",                              // Hexadecimal format (5000)
-						"gas_used":                 "0x0",                                 // Hexadecimal format
-						"timestamp":                fmt.Sprintf("0x%x", currentTimestamp), // Use the same timestamp as SSZ calculation
-						"extra_data":               "0x",
-						"base_fee_per_gas":         "0x0", // Hexadecimal format
-						"block_hash":               zeroHash32(),
+						"parent_hash":              blk.Message.Body.ExecutionPayload.ParentHash,
+						"fee_recipient":            blk.Message.Body.ExecutionPayload.FeeRecipient,
+						"state_root":               blk.Message.Body.ExecutionPayload.StateRoot,
+						"receipts_root":            blk.Message.Body.ExecutionPayload.ReceiptsRoot,
+						"logs_bloom":               blk.Message.Body.ExecutionPayload.LogsBloom,
+						"prev_randao":              blk.Message.Body.ExecutionPayload.PrevRandao,
+						"block_number":             blk.Message.Body.ExecutionPayload.BlockNumber,
+						"gas_limit":                blk.Message.Body.ExecutionPayload.GasLimit,
+						"gas_used":                 blk.Message.Body.ExecutionPayload.GasUsed,
+						"timestamp":                blk.Message.Body.ExecutionPayload.Timestamp,
+						"extra_data":               blk.Message.Body.ExecutionPayload.ExtraData,
+						"base_fee_per_gas":         blk.Message.Body.ExecutionPayload.BaseFeePerGas,
+						"block_hash":               blk.Message.Body.ExecutionPayload.BlockHash,
 						"transactions":             []interface{}{},
-						"withdrawals":              []interface{}{}, // Added in Capella fork
-						"blob_gas_used":            "0x0",           // Added in Deneb fork - use hex format for consistency
-						"excess_blob_gas":          "0x0",           // Added in Deneb fork - use hex format for consistency
-						"parent_beacon_block_root": zeroHash32(),    // Added in Deneb fork
+						"withdrawals":              []interface{}{},
+						"blob_gas_used":            blk.Message.Body.ExecutionPayload.BlobGasUsed,
+						"excess_blob_gas":          blk.Message.Body.ExecutionPayload.ExcessBlobGas,
+						"parent_beacon_block_root": blk.Message.Body.ExecutionPayload.ParentBeaconBlockRoot,
 					},
-
-					// Optional for Deneb: blob KZG commitments
 					"blob_kzg_commitments": []interface{}{},
 				},
 			},
