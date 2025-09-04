@@ -130,6 +130,40 @@ func (app *ABCIApplication) UpdateForkchoice(ctx context.Context, state *engine.
 	return nil
 }
 
+func (app *ABCIApplication) GetLatestBlock(ctx context.Context) (height int64, hash string, err error) {
+	// Get latest block from CometBFT
+	status, err := app.bridge.consClient.GetStatus(ctx)
+	if err != nil {
+		// Return default values instead of error when CometBFT is not available
+		log.Printf("Warning: Failed to get CometBFT status: %v, returning default values", err)
+		return 0, "0x0000000000000000000000000000000000000000000000000000000000000000", nil
+	}
+
+	// Extract block height and hash from status
+	if syncInfo, ok := status["sync_info"].(map[string]interface{}); ok {
+		if heightStr, ok := syncInfo["latest_block_height"].(string); ok {
+			// Convert string to int64
+			if heightInt, err := fmt.Sscanf(heightStr, "%d", &height); err != nil {
+				log.Printf("Warning: Failed to parse block height: %v, using default", err)
+				return 0, "0x0000000000000000000000000000000000000000000000000000000000000000", nil
+			} else if heightInt != 1 {
+				log.Printf("Warning: Failed to parse block height: expected 1 item, got %d, using default", heightInt)
+				return 0, "0x0000000000000000000000000000000000000000000000000000000000000000", nil
+			}
+		}
+
+		if hashStr, ok := syncInfo["latest_block_hash"].(string); ok {
+			hash = "0x" + hashStr
+		}
+
+		return height, hash, nil
+	}
+
+	// Return default values if no sync info available
+	log.Printf("Warning: No sync info available, returning default values")
+	return 0, "0x0000000000000000000000000000000000000000000000000000000000000000", nil
+}
+
 // ABCIServer implements a socket server using the official CometBFT ABCI server
 type ABCIServer struct {
 	bridge *Bridge

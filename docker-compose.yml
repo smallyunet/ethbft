@@ -28,6 +28,11 @@ services:
       - --syncmode=full
       - --gcmode=archive
       - --txlookuplimit=0
+      - --authrpc.addr=0.0.0.0
+      - --authrpc.port=8551
+      - --authrpc.jwtsecret=/jwt.hex
+      - --authrpc.vhosts=*
+      - --beacon.api=http://ethbft:8551
     restart: unless-stopped
 
   ethbft:

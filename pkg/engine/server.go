@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/smallyunet/ethbft/pkg/config"
@@ -25,66 +27,18 @@ type Server struct {
 
 	// Communication with ABCI app
 	abciClient ABCIClient
-}
 
-// ABCIClient defines the interface to communicate with ABCI application
-type ABCIClient interface {
-	GetPendingPayload(ctx context.Context) (*ExecutionPayload, error)
-	ExecutePayload(ctx context.Context, payload *ExecutionPayload) error
-	UpdateForkchoice(ctx context.Context, state *ForkchoiceState) error
-}
+	// Block tracking
+	latestBlockHeight int64
+	latestBlockHash   string
+	headRoot          string           // beacon root
+	slotRoots         map[int64]string // slot -> root
+	rootSlots         map[string]int64 // root -> slot
+	blockMutex        sync.RWMutex
 
-// ExecutionPayload represents an execution payload
-type ExecutionPayload struct {
-	ParentHash    string   `json:"parentHash"`
-	FeeRecipient  string   `json:"feeRecipient"`
-	StateRoot     string   `json:"stateRoot"`
-	ReceiptsRoot  string   `json:"receiptsRoot"`
-	LogsBloom     string   `json:"logsBloom"`
-	PrevRandao    string   `json:"prevRandao"`
-	BlockNumber   string   `json:"blockNumber"`
-	GasLimit      string   `json:"gasLimit"`
-	GasUsed       string   `json:"gasUsed"`
-	Timestamp     string   `json:"timestamp"`
-	ExtraData     string   `json:"extraData"`
-	BaseFeePerGas string   `json:"baseFeePerGas"`
-	BlockHash     string   `json:"blockHash"`
-	Transactions  []string `json:"transactions"`
-}
-
-// ForkchoiceState represents the forkchoice state
-type ForkchoiceState struct {
-	HeadBlockHash      string `json:"headBlockHash"`
-	SafeBlockHash      string `json:"safeBlockHash"`
-	FinalizedBlockHash string `json:"finalizedBlockHash"`
-}
-
-// PayloadAttributes represents payload building attributes
-type PayloadAttributes struct {
-	Timestamp             string   `json:"timestamp"`
-	PrevRandao            string   `json:"prevRandao"`
-	SuggestedFeeRecipient string   `json:"suggestedFeeRecipient"`
-	Withdrawals           []string `json:"withdrawals,omitempty"`
-}
-
-// PayloadStatus represents the payload execution status
-type PayloadStatus struct {
-	Status          string  `json:"status"`          // VALID, INVALID, SYNCING, ACCEPTED
-	LatestValidHash *string `json:"latestValidHash"` // Hash of the most recent valid block
-	ValidationError *string `json:"validationError"` // Error message if invalid
-}
-
-// ForkchoiceUpdatedResponse represents the response to forkchoice update
-type ForkchoiceUpdatedResponse struct {
-	PayloadStatus PayloadStatus `json:"payloadStatus"`
-	PayloadId     *string       `json:"payloadId"` // Identifier of the payload build process
-}
-
-// TransitionConfiguration represents the transition configuration
-type TransitionConfiguration struct {
-	TerminalTotalDifficulty string `json:"terminalTotalDifficulty"`
-	TerminalBlockHash       string `json:"terminalBlockHash"`
-	TerminalBlockNumber     string `json:"terminalBlockNumber"`
+	// Event stream clients
+	eventClients    map[chan []byte]bool
+	eventClientsMux sync.RWMutex
 }
 
 // NewServer creates a new Engine API server
@@ -109,7 +63,13 @@ func NewServer(cfg *config.Config, abciClient ABCIClient) (*Server, error) {
 			SafeBlockHash:      "0x0000000000000000000000000000000000000000000000000000000000000000",
 			FinalizedBlockHash: "0x0000000000000000000000000000000000000000000000000000000000000000",
 		},
+		eventClients: make(map[chan []byte]bool),
+		slotRoots:    make(map[int64]string),
+		rootSlots:    make(map[string]int64),
 	}
+
+	// Start block monitoring
+	go server.monitorBlocks()
 
 	return server, nil
 }
@@ -157,11 +117,18 @@ func (s *Server) Stop() error {
 
 // handleRequest handles all JSON-RPC requests
 func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
+	// Handle both POST (JSON-RPC) and GET (Beacon API) requests
+	if r.Method == "POST" {
+		s.handleJSONRPC(w, r)
+	} else if r.Method == "GET" {
+		s.handleBeaconAPI(w, r)
+	} else {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
 	}
+}
 
+// handleJSONRPC handles JSON-RPC requests (Engine API)
+func (s *Server) handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 	// Verify JWT authentication
 	if s.jwtSecret != "" {
 		if err := s.verifyJWT(r); err != nil {
@@ -206,12 +173,61 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		result, err = s.handleGetPayload(req.Params)
 	case "engine_exchangeTransitionConfigurationV1":
 		result, err = s.handleExchangeTransitionConfiguration(req.Params)
+	case "engine_getPayloadBodiesByHashV1":
+		result, err = s.handleGetPayloadBodiesByHash(req.Params)
+	case "engine_getPayloadBodiesByRangeV1":
+		result, err = s.handleGetPayloadBodiesByRange(req.Params)
 	default:
 		err = fmt.Errorf("method %s not found", req.Method)
 	}
 
 	// Send response
 	s.sendResponse(w, req.ID, result, err)
+}
+
+// monitorBlocks continuously monitors for new blocks from CometBFT
+func (s *Server) monitorBlocks() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	height, hash, err := s.abciClient.GetLatestBlock(context.Background())
+	if err != nil {
+		s.blockMutex.Lock()
+		s.latestBlockHeight = 0
+		s.latestBlockHash = zeroHash32()
+		s.headRoot = s.latestBlockHash
+		s.blockMutex.Unlock()
+	} else {
+		s.blockMutex.Lock()
+		s.latestBlockHeight = height
+		s.latestBlockHash = normalizeRoot(hash)
+		s.headRoot = s.latestBlockHash
+		s.slotRoots[height] = s.headRoot
+		s.rootSlots[s.headRoot] = height
+		s.blockMutex.Unlock()
+	}
+
+	for {
+		<-ticker.C
+		h, hsh, err := s.abciClient.GetLatestBlock(context.Background())
+		if err != nil {
+			log.Printf("GetLatestBlock: %v", err)
+			continue
+		}
+		s.blockMutex.Lock()
+		if h > s.latestBlockHeight {
+			s.latestBlockHeight = h
+			s.latestBlockHash = normalizeRoot(hsh)
+			s.headRoot = s.latestBlockHash
+			s.slotRoots[h] = s.headRoot
+			s.rootSlots[s.headRoot] = h
+			s.blockMutex.Unlock()
+			log.Printf("New block: height=%d root=%s", h, s.headRoot)
+			s.broadcastHeadEvent(h, s.headRoot)
+		} else {
+			s.blockMutex.Unlock()
+		}
+	}
 }
 
 // verifyJWT verifies the JWT token in the request
@@ -238,153 +254,19 @@ func (s *Server) verifyJWT(r *http.Request) error {
 
 // loadJWTSecret loads the JWT secret from file
 func loadJWTSecret(path string) (string, error) {
-	// This should read from the JWT file
-	// For now, return a placeholder
-	return "your-jwt-secret", nil
-}
-
-// JSON-RPC types
-type jsonRPCRequest struct {
-	JSONRPC string          `json:"jsonrpc"`
-	Method  string          `json:"method"`
-	Params  json.RawMessage `json:"params"`
-	ID      interface{}     `json:"id"`
-}
-
-type jsonRPCResponse struct {
-	JSONRPC string      `json:"jsonrpc"`
-	ID      interface{} `json:"id"`
-	Result  interface{} `json:"result,omitempty"`
-	Error   *rpcError   `json:"error,omitempty"`
-}
-
-type rpcError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
-
-// sendResponse sends a JSON-RPC response
-func (s *Server) sendResponse(w http.ResponseWriter, id interface{}, result interface{}, err error) {
-	resp := jsonRPCResponse{
-		JSONRPC: "2.0",
-		ID:      id,
-	}
-
+	// Read the JWT secret from the file
+	content, err := os.ReadFile(path)
 	if err != nil {
-		resp.Error = &rpcError{
-			Code:    -32000,
-			Message: err.Error(),
-		}
-	} else {
-		resp.Result = result
+		return "", fmt.Errorf("failed to read JWT secret file %s: %w", path, err)
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	// Trim any whitespace and newlines
+	secret := strings.TrimSpace(string(content))
+	if secret == "" {
+		return "", fmt.Errorf("JWT secret file %s is empty", path)
+	}
+
+	return secret, nil
 }
 
-// Engine API method handlers
-
-func (s *Server) handleNewPayload(params json.RawMessage) (interface{}, error) {
-	var payload ExecutionPayload
-	if err := json.Unmarshal(params, &[]interface{}{&payload}); err != nil {
-		return nil, fmt.Errorf("invalid params: %v", err)
-	}
-
-	log.Printf("Received new payload: block %s", payload.BlockNumber)
-
-	// Execute the payload via ABCI
-	if err := s.abciClient.ExecutePayload(context.Background(), &payload); err != nil {
-		errMsg := err.Error()
-		return PayloadStatus{
-			Status:          "INVALID",
-			LatestValidHash: nil,
-			ValidationError: &errMsg,
-		}, nil
-	}
-
-	s.latestPayload = &payload
-
-	validHash := payload.BlockHash
-	return PayloadStatus{
-		Status:          "VALID",
-		LatestValidHash: &validHash,
-		ValidationError: nil,
-	}, nil
-}
-
-func (s *Server) handleForkchoiceUpdated(params json.RawMessage) (interface{}, error) {
-	var args []json.RawMessage
-	if err := json.Unmarshal(params, &args); err != nil {
-		return nil, fmt.Errorf("invalid params: %v", err)
-	}
-
-	if len(args) < 1 {
-		return nil, fmt.Errorf("missing forkchoice state")
-	}
-
-	var state ForkchoiceState
-	if err := json.Unmarshal(args[0], &state); err != nil {
-		return nil, fmt.Errorf("invalid forkchoice state: %v", err)
-	}
-
-	log.Printf("Forkchoice updated: head=%s, safe=%s, finalized=%s",
-		state.HeadBlockHash, state.SafeBlockHash, state.FinalizedBlockHash)
-
-	// Update our state
-	s.forkchoiceState = &state
-
-	// Notify ABCI
-	if err := s.abciClient.UpdateForkchoice(context.Background(), &state); err != nil {
-		return nil, fmt.Errorf("failed to update forkchoice: %v", err)
-	}
-
-	response := ForkchoiceUpdatedResponse{
-		PayloadStatus: PayloadStatus{
-			Status:          "VALID",
-			LatestValidHash: &state.HeadBlockHash,
-			ValidationError: nil,
-		},
-		PayloadId: nil,
-	}
-
-	// If there are payload attributes, prepare a new payload
-	if len(args) >= 2 {
-		var attrs PayloadAttributes
-		if err := json.Unmarshal(args[1], &attrs); err == nil {
-			s.payloadCounter++
-			payloadId := fmt.Sprintf("0x%x", s.payloadCounter)
-			response.PayloadId = &payloadId
-
-			log.Printf("Prepared payload with ID: %s", payloadId)
-		}
-	}
-
-	return response, nil
-}
-
-func (s *Server) handleGetPayload(params json.RawMessage) (interface{}, error) {
-	var payloadId string
-	if err := json.Unmarshal(params, &[]interface{}{&payloadId}); err != nil {
-		return nil, fmt.Errorf("invalid params: %v", err)
-	}
-
-	log.Printf("Getting payload for ID: %s", payloadId)
-
-	// Get payload from ABCI
-	payload, err := s.abciClient.GetPendingPayload(context.Background())
-	if err != nil {
-		return nil, fmt.Errorf("failed to get payload: %v", err)
-	}
-
-	return payload, nil
-}
-
-func (s *Server) handleExchangeTransitionConfiguration(params json.RawMessage) (interface{}, error) {
-	// Return default transition configuration
-	return TransitionConfiguration{
-		TerminalTotalDifficulty: "0x0",
-		TerminalBlockHash:       "0x0000000000000000000000000000000000000000000000000000000000000000",
-		TerminalBlockNumber:     "0x0",
-	}, nil
-}
+// verifyJWT verifies the JWT token in the request

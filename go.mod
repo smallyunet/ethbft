@@ -2,8 +2,6 @@ module github.com/smallyunet/ethbft
 
 go 1.23.5
 
-toolchain go1.24.6
-
 require (
 	github.com/cometbft/cometbft v0.38.0
 	gopkg.in/yaml.v3 v3.0.1
