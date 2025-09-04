@@ -11,6 +11,7 @@ type ABCIClient interface {
 	ExecutePayload(ctx context.Context, payload *ExecutionPayload) error
 	UpdateForkchoice(ctx context.Context, state *ForkchoiceState) error
 	GetLatestBlock(ctx context.Context) (height int64, hash string, err error)
+	GetLatestExecutionStateRoot(ctx context.Context) (string, error)
 }
 
 // ExecutionPayload represents an execution payload

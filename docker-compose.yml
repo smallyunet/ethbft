@@ -33,6 +33,7 @@ services:
       - --authrpc.jwtsecret=/jwt.hex
       - --authrpc.vhosts=*
       - --beacon.api=http://ethbft:8551
+      - --verbosity=3
     restart: unless-stopped
 
   ethbft:

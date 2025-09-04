@@ -1,12 +1,14 @@
 package engine
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Beacon API handlers
@@ -15,7 +17,11 @@ func (s *Server) handleHeadHeader(w http.ResponseWriter, r *http.Request) {
 	s.blockMutex.RLock()
 	slot := s.latestBlockHeight
 	root := s.headRoot
+	hdrFields, ok := s.headerData[root]
 	s.blockMutex.RUnlock()
+	if !ok { // fallback minimal
+		hdrFields = beaconHeaderFields{Slot: slot, ParentRoot: zeroHash32(), StateRoot: s.latestBlockHash, BodyRoot: zeroHash32()}
+	}
 
 	resp := map[string]interface{}{
 		"data": map[string]interface{}{
@@ -23,11 +29,11 @@ func (s *Server) handleHeadHeader(w http.ResponseWriter, r *http.Request) {
 			"canonical": true,
 			"header": map[string]interface{}{
 				"message": map[string]interface{}{
-					"slot":           strconv.FormatInt(slot, 10),
+					"slot":           strconv.FormatInt(hdrFields.Slot, 10),
 					"proposer_index": "0",
-					"parent_root":    zeroHash32(),
-					"state_root":     root,
-					"body_root":      zeroHash32(),
+					"parent_root":    hdrFields.ParentRoot,
+					"state_root":     hdrFields.StateRoot,
+					"body_root":      hdrFields.BodyRoot,
 				},
 				"signature": zeroSig96(),
 			},
@@ -65,8 +71,8 @@ func (s *Server) handleBeaconState(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleBeaconForks(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]interface{}{
 		"data": map[string]interface{}{
-			"previous_version": "0x00000000",
-			"current_version":  "0x00000000", // phase0
+			"previous_version": "0x03000000", // capella
+			"current_version":  "0x04000000", // deneb
 			"epoch":            "0",
 		},
 	}
@@ -128,35 +134,98 @@ func (s *Server) handleBeaconBlock(w http.ResponseWriter, r *http.Request) {
 	}
 	id := parts[len(parts)-1]
 
+	var (
+		root  string
+		found bool
+	)
+
 	s.blockMutex.RLock()
-	slot := s.latestBlockHeight
-	root := s.headRoot
 	if id == "head" {
-		// current
+		root = s.headRoot
+		found = true
 	} else if strings.HasPrefix(id, "0x") {
-		if sl, ok := s.rootSlots[normalizeRoot(id)]; ok {
-			slot = sl
+		if _, ok := s.rootSlots[normalizeRoot(id)]; ok {
 			root = normalizeRoot(id)
+			found = true
 		}
 	} else if n, err := strconv.ParseInt(id, 10, 64); err == nil {
 		if rt, ok := s.slotRoots[n]; ok {
-			slot = n
 			root = rt
+			found = true
 		}
 	}
 	s.blockMutex.RUnlock()
 
+	if !found {
+		http.Error(w, "Block not found", http.StatusNotFound)
+		return
+	}
+
+	hdrFields, ok := s.headerData[root]
+	if !ok {
+		// When header data is not found, try to rebuild it from current state
+		// This prevents hash mismatch errors when GETH requests a beacon block by hash
+		log.Printf("WARNING: Header data not found for root %s, attempting to rebuild", root)
+
+		// Try to find the slot from rootSlots mapping
+		var slot int64
+		if sl, exists := s.rootSlots[root]; exists {
+			slot = sl
+		} else {
+			log.Printf("ERROR: Could not find slot for root %s", root)
+			http.Error(w, "Beacon block not found", http.StatusNotFound)
+			return
+		}
+
+		// Try to rebuild the header data
+		s.blockMutex.RLock()
+		execStateRoot := s.latestBlockHash
+		parentRoot := "0x0000000000000000000000000000000000000000000000000000000000000000"
+		if slot > 0 {
+			// Try to find parent from previous slot
+			if prevRoot, exists := s.slotRoots[slot-1]; exists {
+				parentRoot = prevRoot
+			}
+		}
+		s.blockMutex.RUnlock()
+
+		bodyRoot := computeBeaconBodyRootWithStateRoot(&ExecutionPayload{StateRoot: execStateRoot})
+		hdrFields = beaconHeaderFields{
+			Slot:       slot,
+			ParentRoot: parentRoot,
+			StateRoot:  execStateRoot,
+			BodyRoot:   bodyRoot,
+		}
+
+		// Verify that the rebuilt header produces the expected root
+		rebuiltRoot := computeBeaconHeaderRoot(hdrFields)
+		if rebuiltRoot != root {
+			log.Printf("ERROR: Rebuilt header root %s does not match expected root %s", rebuiltRoot, root)
+			http.Error(w, "Beacon block root mismatch", http.StatusNotFound)
+			return
+		}
+
+		// Store the rebuilt header data for future use
+		s.blockMutex.Lock()
+		s.headerData[root] = hdrFields
+		s.blockMutex.Unlock()
+
+		log.Printf("Successfully rebuilt header data for root %s", root)
+	}
 	resp := map[string]interface{}{
 		"data": map[string]interface{}{
 			"message": map[string]interface{}{
-				"slot":           strconv.FormatInt(slot, 10),
+				"slot":           strconv.FormatInt(hdrFields.Slot, 10),
 				"proposer_index": "0",
-				"parent_root":    zeroHash32(),
-				"state_root":     root,
-				"body_root":      zeroHash32(),
+				"parent_root":    hdrFields.ParentRoot,
+				"state_root":     hdrFields.StateRoot,
+				"body_root":      hdrFields.BodyRoot,
 			},
 			"signature": zeroSig96(),
 		},
+	}
+	if true { // toggle to true for per-request debug
+		log.Printf("DEBUG serve block root=%s slot=%d parent=%s state=%s body=%s", root, hdrFields.Slot, hdrFields.ParentRoot, hdrFields.StateRoot, hdrFields.BodyRoot)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
@@ -170,34 +239,64 @@ func (s *Server) handleBeaconHeader(w http.ResponseWriter, r *http.Request) {
 	}
 	id := parts[len(parts)-1]
 
+	var (
+		slot  int64
+		root  string
+		found bool
+	)
 	s.blockMutex.RLock()
-	slot := s.latestBlockHeight
-	root := s.headRoot
 	if id == "head" {
+		slot = s.latestBlockHeight
+		root = s.headRoot
+		found = true
 	} else if strings.HasPrefix(id, "0x") {
 		if sl, ok := s.rootSlots[normalizeRoot(id)]; ok {
 			slot = sl
 			root = normalizeRoot(id)
+			found = true
 		}
 	} else if n, err := strconv.ParseInt(id, 10, 64); err == nil {
 		if rt, ok := s.slotRoots[n]; ok {
 			slot = n
 			root = rt
+			found = true
 		}
 	}
 	s.blockMutex.RUnlock()
+	if !found {
+		http.Error(w, "Block not found", http.StatusNotFound)
+		return
+	}
+	// Defensive: ensure mapping present (id might have been head when first requested)
+	s.blockMutex.Lock()
+	if _, ok := s.rootSlots[root]; !ok {
+		s.rootSlots[root] = slot
+	}
+	if _, ok := s.slotRoots[slot]; !ok {
+		s.slotRoots[slot] = root
+	}
+	s.blockMutex.Unlock()
 
+	hdrFields2, ok := s.headerData[root]
+	if !ok {
+		// When header data is not found, use the latest execution state root instead of the beacon header root
+		s.blockMutex.RLock()
+		execStateRoot := s.latestBlockHash // This should be the execution state root
+		s.blockMutex.RUnlock()
+		hdrFields2 = beaconHeaderFields{Slot: slot, ParentRoot: zeroHash32(), StateRoot: execStateRoot, BodyRoot: zeroHash32()}
+		log.Printf("WARNING: Header data not found for root %s in handleBeaconHeader, using fallback with execStateRoot %s", root, execStateRoot)
+	}
 	resp := map[string]interface{}{
 		"data": map[string]interface{}{
 			"root":      root,
 			"canonical": true,
 			"header": map[string]interface{}{
 				"message": map[string]interface{}{
-					"slot":           strconv.FormatInt(slot, 10),
+					"slot":           strconv.FormatInt(hdrFields2.Slot, 10),
 					"proposer_index": "0",
-					"parent_root":    zeroHash32(),
-					"state_root":     root,
-					"body_root":      zeroHash32(),
+					"parent_root":    hdrFields2.ParentRoot,
+					"state_root":     hdrFields2.StateRoot,
+					"body_root":      hdrFields2.BodyRoot,
 				},
 				"signature": zeroSig96(),
 			},
@@ -215,32 +314,129 @@ func (s *Server) handleBeaconBlockV2(w http.ResponseWriter, r *http.Request) {
 	}
 	id := parts[len(parts)-1]
 
+	// Debug: log incoming Geth request and current state
+	log.Printf("GETH_REQUEST: Geth requesting beacon block for ID: %s", id)
+	log.Printf("GETH_REQUEST: Full URL path: %s", r.URL.Path)
+
+	// Show our current state for debugging
 	s.blockMutex.RLock()
-	slot := s.latestBlockHeight
-	root := s.headRoot
-	if id != "head" {
-		if strings.HasPrefix(id, "0x") {
-			if sl, ok := s.rootSlots[normalizeRoot(id)]; ok {
-				slot = sl
-				root = normalizeRoot(id)
-			}
-		} else if n, err := strconv.ParseInt(id, 10, 64); err == nil {
-			if rt, ok := s.slotRoots[n]; ok {
-				slot = n
-				root = rt
-			}
+	log.Printf("GETH_REQUEST: Our current rootSlots map has %d entries", len(s.rootSlots))
+	log.Printf("GETH_REQUEST: Our current slotRoots map has %d entries", len(s.slotRoots))
+	log.Printf("GETH_REQUEST: Latest block height: %d, head root: %s", s.latestBlockHeight, s.headRoot)
+	// Show some recent roots
+	for i := s.latestBlockHeight - 3; i <= s.latestBlockHeight; i++ {
+		if root, exists := s.slotRoots[i]; exists {
+			log.Printf("GETH_REQUEST: Slot %d -> Root %s", i, root)
 		}
 	}
 	s.blockMutex.RUnlock()
 
+	var (
+		slot  int64
+		root  string
+		found bool
+	)
+	s.blockMutex.RLock()
+	if id == "head" {
+		slot = s.latestBlockHeight
+		root = s.headRoot
+		found = true
+	} else if strings.HasPrefix(id, "0x") {
+		if sl, ok := s.rootSlots[normalizeRoot(id)]; ok {
+			slot = sl
+			root = normalizeRoot(id)
+			found = true
+		}
+	} else if n, err := strconv.ParseInt(id, 10, 64); err == nil {
+		if rt, ok := s.slotRoots[n]; ok {
+			slot = n
+			root = rt
+			found = true
+		}
+	}
+	s.blockMutex.RUnlock()
+	if !found {
+		http.Error(w, "Block not found", http.StatusNotFound)
+		return
+	}
+	// Defensive insert
+	s.blockMutex.Lock()
+	if _, ok := s.rootSlots[root]; !ok {
+		s.rootSlots[root] = slot
+	}
+	if _, ok := s.slotRoots[slot]; !ok {
+		s.slotRoots[slot] = root
+	}
+	s.blockMutex.Unlock()
+
+	// Generate consistent timestamp for both SSZ calculation and JSON response
+	currentTimestamp := uint64(time.Now().Unix())
+
+	// Try to get the actual execution payload from Geth for accurate beacon block body
+	var actualPayload *ExecutionPayload
+	if payload, err := s.abciClient.GetPendingPayload(context.Background()); err == nil {
+		actualPayload = payload
+		log.Printf("DEBUG: Got actual execution payload for JSON response: parentHash=%s, stateRoot=%s, blockNumber=%s",
+			payload.ParentHash, payload.StateRoot, payload.BlockNumber)
+	} else {
+		log.Printf("WARNING: Could not get execution payload for JSON response: %v", err)
+	}
+
+	hdrFields3, ok := s.headerData[root]
+	if !ok {
+		// When header data is not found, use the latest execution state root instead of the beacon header root
+		s.blockMutex.RLock()
+		execStateRoot := s.latestBlockHash // This should be the execution state root
+		s.blockMutex.RUnlock()
+
+		// Calculate the correct body root with the actual execution payload data
+		var bodyRoot string
+		if actualPayload != nil {
+			// Use the COMPLETE execution payload for body root calculation to match JSON response
+			bodyRoot = computeBeaconBodyRootWithRealPayload(actualPayload)
+			log.Printf("BODY_ROOT_CALC: Using complete execution payload for SSZ calculation (fallback)")
+		} else {
+			// Fallback to using the simple state root method
+			bodyRoot = computeBeaconBodyRootWithStateRoot(&ExecutionPayload{StateRoot: execStateRoot})
+			log.Printf("BODY_ROOT_CALC: Using fallback method (no execution payload)")
+		}
+
+		hdrFields3 = beaconHeaderFields{Slot: slot, ParentRoot: zeroHash32(), StateRoot: execStateRoot, BodyRoot: bodyRoot}
+		log.Printf("WARNING: Header data not found for root %s, using fallback with execStateRoot %s, bodyRoot %s", root, execStateRoot, bodyRoot)
+	} else {
+		// CRITICAL: Do NOT recalculate body root when serving beacon blocks
+		// The body root must remain exactly as it was when the beacon block root was originally computed
+		// Any changes to body root will cause beacon block root mismatch errors from geth
+		log.Printf("BODY_ROOT_CALC: Using existing body root (no recalculation): %s", hdrFields3.BodyRoot)
+	}
+
+	// Debug: log the state root being used in the beacon block
+	log.Printf("DEBUG: BeaconBlockV2 using StateRoot: %s, BodyRoot: %s for root %s", hdrFields3.StateRoot, hdrFields3.BodyRoot, root)
+
+	// CRITICAL: Recalculate beacon block root based on the header fields we're actually returning
+	actualBeaconRoot := computeBeaconHeaderRoot(hdrFields3)
+
+	// Debug: log the final beacon block response that will be sent to Geth
+	log.Printf("BEACON_RESPONSE: Returning beacon block for slot %d with:", hdrFields3.Slot)
+	log.Printf("BEACON_RESPONSE:   - slot: %d", hdrFields3.Slot)
+	log.Printf("BEACON_RESPONSE:   - parent_root: %s", hdrFields3.ParentRoot)
+	log.Printf("BEACON_RESPONSE:   - state_root: %s", hdrFields3.StateRoot)
+	log.Printf("BEACON_RESPONSE:   - body_root: %s", hdrFields3.BodyRoot)
+	log.Printf("BEACON_RESPONSE:   - beacon_block_root (stored): %s", root)
+	log.Printf("BEACON_RESPONSE:   - beacon_block_root (recalculated): %s", actualBeaconRoot)
+	if root != actualBeaconRoot {
+		log.Printf("BEACON_RESPONSE: WARNING - Root mismatch! Stored: %s, Calculated: %s", root, actualBeaconRoot)
+	}
+
 	resp := map[string]interface{}{
-		"version": "phase0",
+		"version": "deneb", // Critical field specifying the fork version
 		"data": map[string]interface{}{
 			"message": map[string]interface{}{
-				"slot":           strconv.FormatInt(slot, 10),
+				"slot":           strconv.FormatInt(hdrFields3.Slot, 10),
 				"proposer_index": "0",
-				"parent_root":    zeroHash32(),
-				"state_root":     root,
+				"parent_root":    hdrFields3.ParentRoot,
+				"state_root":     hdrFields3.StateRoot,
+				"body_root":      hdrFields3.BodyRoot, // Critical: beacon header must include body_root for hash calculation
 				"body": map[string]interface{}{
 					"randao_reveal": zeroSig96(),
 					"eth1_data": map[string]interface{}{
@@ -254,6 +450,38 @@ func (s *Server) handleBeaconBlockV2(w http.ResponseWriter, r *http.Request) {
 					"attestations":       []interface{}{},
 					"deposits":           []interface{}{},
 					"voluntary_exits":    []interface{}{},
+
+					// Required since Altair fork
+					"sync_aggregate": map[string]interface{}{
+						"sync_committee_bits":      zeroHexBytes(64), // 512 bits
+						"sync_committee_signature": zeroSig96(),
+					},
+
+					// Required for Deneb: execution_payload structure must match the data used for body_root calculation
+					// CRITICAL: Use consistent data structure that matches our SSZ body_root calculation
+					"execution_payload": map[string]interface{}{
+						"parent_hash":              zeroHash32(),
+						"fee_recipient":            zeroHexBytes(20),                                                     // address
+						"state_root":               hdrFields3.StateRoot,                                                 // Must match the state_root used in body_root calculation
+						"receipts_root":            "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421", // Empty tree root
+						"logs_bloom":               zeroBloom256(),                                                       // 256 bytes
+						"prev_randao":              zeroHash32(),
+						"block_number":             fmt.Sprintf("0x%x", slot),             // Use actual slot as block number
+						"gas_limit":                "0x1388",                              // Hexadecimal format (5000)
+						"gas_used":                 "0x0",                                 // Hexadecimal format
+						"timestamp":                fmt.Sprintf("0x%x", currentTimestamp), // Use the same timestamp as SSZ calculation
+						"extra_data":               "0x",
+						"base_fee_per_gas":         "0x0", // Hexadecimal format
+						"block_hash":               zeroHash32(),
+						"transactions":             []interface{}{},
+						"withdrawals":              []interface{}{}, // Added in Capella fork
+						"blob_gas_used":            "0x0",           // Added in Deneb fork - use hex format for consistency
+						"excess_blob_gas":          "0x0",           // Added in Deneb fork - use hex format for consistency
+						"parent_beacon_block_root": zeroHash32(),    // Added in Deneb fork
+					},
+
+					// Optional for Deneb: blob KZG commitments
+					"blob_kzg_commitments": []interface{}{},
 				},
 			},
 			"signature": zeroSig96(),

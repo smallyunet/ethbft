@@ -16,7 +16,7 @@ func (s *Server) handleNewPayload(params json.RawMessage) (interface{}, error) {
 		return nil, fmt.Errorf("invalid params: %v", err)
 	}
 
-	log.Printf("Received new payload: block %s", payload.BlockNumber)
+	log.Printf("Received new payload: block %s with state root %s", payload.BlockNumber, payload.StateRoot)
 
 	// Execute the payload via ABCI
 	if err := s.abciClient.ExecutePayload(context.Background(), &payload); err != nil {

@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -116,8 +117,67 @@ func (app *ABCIApplication) ApplySnapshotChunk(ctx context.Context, req *abcityp
 
 // ABCIClient interface implementation for Engine API
 func (app *ABCIApplication) GetPendingPayload(ctx context.Context) (*engine.ExecutionPayload, error) {
-	// TODO: Implement payload retrieval logic
-	return &engine.ExecutionPayload{}, nil
+	if app.bridge.ethClient == nil {
+		return nil, fmt.Errorf("ethereum client not available")
+	}
+
+	// Get the latest block from Geth which contains the execution payload data
+	result, err := app.bridge.ethClient.Call(ctx, "eth_getBlockByNumber", []interface{}{"latest", true})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get block from Geth: %w", err)
+	}
+
+	var block map[string]interface{}
+	if err := json.Unmarshal(result, &block); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal block: %w", err)
+	}
+
+	// Extract execution payload fields from the block
+	payload := &engine.ExecutionPayload{
+		ParentHash:    getStringField(block, "parentHash"),
+		FeeRecipient:  getStringField(block, "miner"), // miner is fee_recipient in execution layer
+		StateRoot:     getStringField(block, "stateRoot"),
+		ReceiptsRoot:  getStringField(block, "receiptsRoot"),
+		LogsBloom:     getStringField(block, "logsBloom"),
+		PrevRandao:    getStringField(block, "mixHash"), // mixHash is prevRandao post-merge
+		BlockNumber:   getStringField(block, "number"),
+		GasLimit:      getStringField(block, "gasLimit"),
+		GasUsed:       getStringField(block, "gasUsed"),
+		Timestamp:     getStringField(block, "timestamp"),
+		ExtraData:     getStringField(block, "extraData"),
+		BaseFeePerGas: getStringField(block, "baseFeePerGas"),
+		BlockHash:     getStringField(block, "hash"),
+		Transactions:  getTransactions(block),
+	}
+
+	log.Printf("Retrieved execution payload from Geth: blockNumber=%s, stateRoot=%s, hash=%s",
+		payload.BlockNumber, payload.StateRoot, payload.BlockHash)
+
+	return payload, nil
+}
+
+// Helper function to safely get string fields from block data
+func getStringField(block map[string]interface{}, field string) string {
+	if value, ok := block[field].(string); ok {
+		return value
+	}
+	return "0x0" // Default value for missing fields
+}
+
+// Helper function to get transactions from block data
+func getTransactions(block map[string]interface{}) []string {
+	if txsInterface, ok := block["transactions"].([]interface{}); ok {
+		transactions := make([]string, len(txsInterface))
+		for i, tx := range txsInterface {
+			if txStr, ok := tx.(string); ok {
+				transactions[i] = txStr
+			} else {
+				transactions[i] = "0x" // Handle transaction objects by defaulting to empty
+			}
+		}
+		return transactions
+	}
+	return []string{} // Return empty slice if no transactions
 }
 
 func (app *ABCIApplication) ExecutePayload(ctx context.Context, payload *engine.ExecutionPayload) error {
@@ -152,8 +212,15 @@ func (app *ABCIApplication) GetLatestBlock(ctx context.Context) (height int64, h
 			}
 		}
 
-		if hashStr, ok := syncInfo["latest_block_hash"].(string); ok {
-			hash = "0x" + hashStr
+		// Get the state root from Geth instead of using CometBFT block hash
+		if gethStateRoot, err := app.getGethStateRoot(ctx, height); err != nil {
+			log.Printf("Warning: Failed to get Geth state root: %v, using CometBFT hash as fallback", err)
+			// Fallback to CometBFT hash
+			if hashStr, ok := syncInfo["latest_block_hash"].(string); ok {
+				hash = "0x" + hashStr
+			}
+		} else {
+			hash = gethStateRoot
 		}
 
 		return height, hash, nil
@@ -162,6 +229,41 @@ func (app *ABCIApplication) GetLatestBlock(ctx context.Context) (height int64, h
 	// Return default values if no sync info available
 	log.Printf("Warning: No sync info available, returning default values")
 	return 0, "0x0000000000000000000000000000000000000000000000000000000000000000", nil
+}
+
+// getGethStateRoot gets the state root from the latest executed payload
+func (app *ABCIApplication) getGethStateRoot(ctx context.Context, height int64) (string, error) {
+	// First, try to get the state root from the bridge's engine server
+	// This is more reliable as it tracks the actual execution state
+
+	if app.bridge.ethClient == nil {
+		return "", fmt.Errorf("ethereum client not available")
+	}
+
+	// Get the latest block from Geth to get the state root
+	result, err := app.bridge.ethClient.Call(ctx, "eth_getBlockByNumber", []interface{}{"latest", false})
+	if err != nil {
+		return "", fmt.Errorf("failed to get block from Geth: %w", err)
+	}
+
+	var block map[string]interface{}
+	if err := json.Unmarshal(result, &block); err != nil {
+		return "", fmt.Errorf("failed to unmarshal block: %w", err)
+	}
+
+	stateRoot, ok := block["stateRoot"].(string)
+	if !ok {
+		return "", fmt.Errorf("state root not found in block")
+	}
+
+	log.Printf("Retrieved Geth state root for height %d: %s", height, stateRoot)
+	return stateRoot, nil
+}
+
+// GetLatestExecutionStateRoot gets the state root from the latest execution,
+// which should be used by the Engine API server for beacon header construction
+func (app *ABCIApplication) GetLatestExecutionStateRoot(ctx context.Context) (string, error) {
+	return app.getGethStateRoot(ctx, 0) // height is not used in current implementation
 }
 
 // ABCIServer implements a socket server using the official CometBFT ABCI server

@@ -31,9 +31,10 @@ type Server struct {
 	// Block tracking
 	latestBlockHeight int64
 	latestBlockHash   string
-	headRoot          string           // beacon root
-	slotRoots         map[int64]string // slot -> root
-	rootSlots         map[string]int64 // root -> slot
+	headRoot          string                        // beacon header root (computed)
+	slotRoots         map[int64]string              // slot -> header root
+	rootSlots         map[string]int64              // header root -> slot
+	headerData        map[string]beaconHeaderFields // header root -> fields
 	blockMutex        sync.RWMutex
 
 	// Event stream clients
@@ -66,10 +67,27 @@ func NewServer(cfg *config.Config, abciClient ABCIClient) (*Server, error) {
 		eventClients: make(map[chan []byte]bool),
 		slotRoots:    make(map[int64]string),
 		rootSlots:    make(map[string]int64),
+		headerData:   make(map[string]beaconHeaderFields),
 	}
 
 	// Start block monitoring
 	go server.monitorBlocks()
+
+	// Debug verifier (can be disabled by removing)
+	go func() {
+		for {
+			time.Sleep(15 * time.Second)
+			server.blockMutex.RLock()
+			for root, fields := range server.headerData {
+				recalc := computeBeaconHeaderRoot(fields)
+				if recalc != root {
+					leaves := computeBeaconHeaderLeaves(fields)
+					log.Printf("DEBUG MISMATCH storedRoot=%s recalc=%s slot=%d parent=%s state=%s body=%s leaves0=%x", root, recalc, fields.Slot, fields.ParentRoot, fields.StateRoot, fields.BodyRoot, leaves[0])
+				}
+			}
+			server.blockMutex.RUnlock()
+		}
+	}()
 
 	return server, nil
 }
@@ -200,10 +218,40 @@ func (s *Server) monitorBlocks() {
 	} else {
 		s.blockMutex.Lock()
 		s.latestBlockHeight = height
-		s.latestBlockHash = normalizeRoot(hash)
-		s.headRoot = s.latestBlockHash
-		s.slotRoots[height] = s.headRoot
-		s.rootSlots[s.headRoot] = height
+
+		// Try to get the execution state root from ABCI client first
+		var stateRoot string
+		if execStateRoot, err := s.abciClient.GetLatestExecutionStateRoot(context.Background()); err == nil {
+			stateRoot = normalizeRoot(execStateRoot)
+			log.Printf("Initial setup: using execution state root from Geth: %s", stateRoot)
+		} else {
+			// Fall back to using the latest payload's state root if available
+			if s.latestPayload != nil && s.latestPayload.StateRoot != "" {
+				stateRoot = normalizeRoot(s.latestPayload.StateRoot)
+				log.Printf("Initial setup: using execution state root from payload: %s", stateRoot)
+			} else {
+				stateRoot = normalizeRoot(hash)
+				log.Printf("Initial setup: using CometBFT hash as fallback: %s (warning: this may cause state root mismatch)", stateRoot)
+			}
+		}
+		s.latestBlockHash = stateRoot
+
+		parent := zeroHash32()
+		if s.headRoot != "" {
+			parent = s.headRoot
+		}
+		bodyRoot := computeBeaconBodyRootWithStateRoot(&ExecutionPayload{StateRoot: stateRoot})
+		hdr := beaconHeaderFields{ // initial head header
+			Slot:       height,
+			ParentRoot: parent,
+			StateRoot:  s.latestBlockHash,
+			BodyRoot:   bodyRoot,
+		}
+		root := computeBeaconHeaderRoot(hdr)
+		s.headRoot = root
+		s.slotRoots[height] = root
+		s.rootSlots[root] = height
+		s.headerData[root] = hdr
 		s.blockMutex.Unlock()
 	}
 
@@ -216,13 +264,62 @@ func (s *Server) monitorBlocks() {
 		}
 		s.blockMutex.Lock()
 		if h > s.latestBlockHeight {
+			prevHead := s.headRoot
 			s.latestBlockHeight = h
-			s.latestBlockHash = normalizeRoot(hsh)
-			s.headRoot = s.latestBlockHash
-			s.slotRoots[h] = s.headRoot
-			s.rootSlots[s.headRoot] = h
+
+			// Try to get the execution state root from ABCI client first
+			var stateRoot string
+			if execStateRoot, err := s.abciClient.GetLatestExecutionStateRoot(context.Background()); err == nil {
+				stateRoot = normalizeRoot(execStateRoot)
+				log.Printf("Using execution state root from Geth: %s", stateRoot)
+			} else {
+				// Fall back to using the latest payload's state root if available
+				if s.latestPayload != nil && s.latestPayload.StateRoot != "" {
+					stateRoot = normalizeRoot(s.latestPayload.StateRoot)
+					log.Printf("Using execution state root from payload: %s", stateRoot)
+				} else {
+					stateRoot = normalizeRoot(hsh)
+					log.Printf("Using CometBFT hash as fallback: %s (warning: this may cause state root mismatch)", stateRoot)
+				}
+			}
+			s.latestBlockHash = stateRoot
+
+			parent := prevHead
+			if parent == "" {
+				parent = zeroHash32()
+			}
+			bodyRoot := computeBeaconBodyRootWithStateRoot(&ExecutionPayload{StateRoot: stateRoot})
+			hdr := beaconHeaderFields{
+				Slot:       h,
+				ParentRoot: parent,
+				StateRoot:  s.latestBlockHash,
+				BodyRoot:   bodyRoot,
+			}
+			newRoot := computeBeaconHeaderRoot(hdr)
+			if true { // verbose chunk debug (spec header chunks expected=4 for Deneb)
+				chunks := computeBeaconHeaderLeaves(hdr)
+				if len(chunks) == 4 {
+					log.Printf("DEBUG header slot=%d parent=%s state=%s body=%s chunks=[%x %x %x %x] root=%s", h, hdr.ParentRoot, hdr.StateRoot, hdr.BodyRoot, chunks[0], chunks[1], chunks[2], chunks[3], newRoot)
+				} else {
+					log.Printf("DEBUG header slot=%d chunkCount=%d root=%s", h, len(chunks), newRoot)
+				}
+			}
+
+			// Debug: log the complete block processing
+			log.Printf("BLOCK_PROCESS: New block from CometBFT:")
+			log.Printf("BLOCK_PROCESS:   - height: %d", h)
+			log.Printf("BLOCK_PROCESS:   - exec_hash_from_geth: %s", stateRoot)
+			log.Printf("BLOCK_PROCESS:   - parent_root: %s", parent)
+			log.Printf("BLOCK_PROCESS:   - body_root: %s", bodyRoot)
+			log.Printf("BLOCK_PROCESS:   - computed_beacon_root: %s", newRoot)
+			log.Printf("BLOCK_PROCESS: This beacon root will be used when Geth requests beacon block data")
+
+			s.headRoot = newRoot
+			s.slotRoots[h] = newRoot
+			s.rootSlots[newRoot] = h
+			s.headerData[newRoot] = hdr
 			s.blockMutex.Unlock()
-			log.Printf("New block: height=%d root=%s", h, s.headRoot)
+			log.Printf("New block: height=%d headerRoot=%s execHash=%s", h, s.headRoot, s.latestBlockHash)
 			s.broadcastHeadEvent(h, s.headRoot)
 		} else {
 			s.blockMutex.Unlock()
