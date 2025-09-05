@@ -1,15 +1,25 @@
-# EthBFT - Ethereum to CometBFT Bridge
+# EthBFT - Ethereum ↔ CometBFT Minimal Bridge
 
-EthBFT is a lightweight bridge that connects Ethereum execution clients (like Geth) with CometBFT consensus. This project enables you to run a blockchain system using Ethereum's execution capabilities with CometBFT's fast and secure consensus mechanism.
+EthBFT is an experimental, lightweight bridge that drives an Ethereum Execution Layer (EL) client (e.g. Geth) using CometBFT block heights as a timing/advancement signal. It focuses on the **Engine API orchestration loop** (forkchoice + payload production) rather than full state / transaction integration. For every new CometBFT height, EthBFT requests the EL to build (currently empty) blocks and advances forkchoice accordingly.
 
-## 🚀 Features
+> Status: Proof‑of‑concept / demo. ABCI logic is minimal, blocks produced by Geth are empty, and no transaction translation is performed yet. Expect breaking changes.
 
-- **ABCI Application**: Full CometBFT ABCI interface implementation
-- **Engine API Client**: Connects to Ethereum Engine API as a client
-- **Health Monitoring**: Built-in connection monitoring and health checks
-- **Docker Support**: Complete containerized deployment
-- **JWT Authentication**: Secure Engine API communication
-- **Lightweight**: Minimal dependencies, focused on core functionality
+## 🚀 Features (Current Scope)
+
+- **Engine API Loop**: Implements the minimal sequence: forkchoiceUpdated → getPayload → newPayload → forkchoiceUpdated (final) per CometBFT height.
+- **Height Tracking**: Maintains mapping of CometBFT height → EL head hash to choose parents.
+- **ABCI Skeleton**: Implements required ABCI methods with no transaction execution (returns OK for all txs).
+- **Dynamic Parent Selection**: Falls back to EL latest head or genesis if internal map has no parent yet.
+- **JWT (HS256) Auth**: Automatically signs Engine API calls when a JWT secret is provided.
+- **Health Endpoint**: HTTP `/health` (port 8081) plus ABCI socket (8080).
+- **Docker Stack**: One‑command demo bringing up Geth + EthBFT + CometBFT.
+- **Config Flag**: `bridge.enableBridging` toggles the block production loop.
+
+### Not (Yet) Implemented
+- Transaction ingestion / translation between CometBFT and EL
+- Execution payload construction from CometBFT data (legacy helpers retained but unused)
+- Safe / finalized head derivation beyond setting all three to the produced head
+- State proofs, validator set management, or multi‑node orchestration
 
 ## 📁 Project Structure
 
@@ -18,9 +28,10 @@ ethbft/
 ├── cmd/
 │   └── ethbft/             # Main application entry point
 ├── pkg/
-│   ├── bridge/             # Bridge between Ethereum and CometBFT
-│   │   ├── bridge.go      # Main bridge logic
-│   │   └── server.go       # ABCI server implementation
+│   ├── bridge/             # Bridge between CometBFT height and Engine API block production
+│   │   ├── bridge.go       # Engine API orchestration & height loop
+│   │   ├── server.go       # ABCI server + health HTTP server
+│   │   └── types.go        # Aliases of go-ethereum Engine API types
 │   ├── config/            # Configuration management
 │   ├── consensus/          # CometBFT client integration
 │   └── ethereum/           # Ethereum client integration
@@ -35,9 +46,11 @@ ethbft/
 
 ## 🛠️ Prerequisites
 
-- **Go 1.24+** (recommended: Go 1.24.6)
-- **Docker & Docker Compose** (for containerized deployment)
-- **OpenSSL** (for JWT secret generation)
+- Go 1.24+ (tested with 1.24.x)
+- Docker & Docker Compose (recommended path)
+- OpenSSL (for JWT secret generation) or any tool that can produce 32 random bytes hex
+
+Optional (manual run): a locally running Geth with Engine API (authrpc) enabled, and a CometBFT node.
 
 ## ⚡ Quick Start
 
@@ -61,7 +74,26 @@ make docker-down
 make docker-rebuild
 ```
 
-### Manual Setup
+### Manual Setup (Without Docker)
+
+You need three processes: Geth (execution), EthBFT (bridge), CometBFT (consensus). Example outline (simplified, adjust for your environment):
+
+```bash
+# 1. Start Geth with Engine API enabled (example minimal flags)
+geth \
+  --networkid=1337 --nodiscover --http --http.addr=0.0.0.0 --http.api=eth,net,web3,txpool \
+  --authrpc.addr=0.0.0.0 --authrpc.port=8551 --authrpc.jwtsecret=./jwt.hex --authrpc.vhosts=* \
+  --gcmode=archive --syncmode=full --datadir=./geth_data
+
+# 2. Start (or initialize) a CometBFT node (ensure it listens on 26657 HTTP)
+#    Using existing home dir in ./cometbft_home (already included for demo)
+cometbft start --home ./cometbft_home
+
+# 3. Run EthBFT
+ETHBFT_CONFIG=./config.yaml ./ethbft
+```
+
+Full dev bootstrap with repository helpers:
 
 ```bash
 # Clone and setup
@@ -86,68 +118,84 @@ make run
 
 ## 🔧 Configuration
 
-EthBFT uses YAML configuration files. Key configuration options:
+EthBFT loads `config.yaml` (or the path in `ETHBFT_CONFIG`). Environment variables may rewrite hostnames for container contexts.
 
-### Main Configuration (`config.yaml`)
+### Example Configuration (`config.yaml`)
 
 ```yaml
 ethereum:
-  endpoint: "http://localhost:8545"
-  engineAPI: "http://localhost:8551"
-  jwtSecret: "./jwt.hex"
+  endpoint: "http://localhost:8545"     # JSON-RPC endpoint used for non-engine calls
+  engineAPI: "http://localhost:8551"     # Auth RPC (Engine API) endpoint
+  jwtSecret: "./jwt.hex"                 # Hex file (>= 32 bytes) used for HS256 JWT
 
 cometbft:
-  endpoint: "http://localhost:26657"
+  endpoint: "tcp://localhost:26657"      # Note: code expects an HTTP-postable endpoint; docker uses http://cometbft:26657
+  homeDir: "./cometbft_home"
 
 bridge:
-  listenAddr: "0.0.0.0:8080"
-  retryInterval: 30
+  listenAddr: "0.0.0.0:8080"            # ABCI socket address
+  logLevel: "info"
+  retryInterval: 5                       # Seconds between connection retries (future use)
+  enableBridging: true                   # If false: ABCI server only, no EL block production
 ```
 
 ### Environment Variables
 
+| Variable | Purpose |
+|----------|---------|
+| `ETHBFT_CONFIG` | Path to config file (defaults to `./config.yaml`). |
+| `ETHEREUM_HOST` | Replaces `localhost` part of `ethereum.endpoint` & `ethereum.engineAPI` (used in Docker). |
+| `COMETBFT_HOST` | Replaces `localhost` in `cometbft.endpoint`. |
+
+Example:
 ```bash
-# Set custom config path
-ETHBFT_CONFIG=/path/to/config.yaml ./ethbft
+ETHEREUM_HOST=geth COMETBFT_HOST=cometbft ETHBFT_CONFIG=./config/docker-config.yaml ./ethbft
 ```
 
-## 🏗️ Architecture
+## 🏗️ Architecture & Flow
 
-EthBFT acts as a bridge layer between Ethereum execution clients and CometBFT consensus:
+High‑level data/control flow (current minimal mode):
 
 ```
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│    Geth     │◄──►│   EthBFT    │◄──►│  CometBFT   │
-│ (Execution)  │    │  (Bridge)   │    │ (Consensus) │
-└─────────────┘    └─────────────┘    └─────────────┘
+CometBFT (height increment) ---> EthBFT loop ---> Engine API (Geth) builds empty block
+         ^                         |                       |
+         |                         | 1) forkchoiceUpdated  |
+         |                         | 2) getPayload         |
+         |                         | 3) newPayload         v
+         +-------------------------+ 4) forkchoiceUpdated (final head)
 ```
 
-### Components
+Key behaviors:
+1. Poll CometBFT `status` every 2s; detect new `latest_block_height`.
+2. For each new height H: pick parent hash (cached prior EL head or fallback) and run Engine API sequence.
+3. Set head/safe/finalized all to the newly produced block hash (demo simplification).
+4. Cache (H → headHash) for next iteration.
 
-1. **ABCI Application**: Implements CometBFT's ABCI interface
-2. **Engine API Client**: Connects to Geth's Engine API as a client
-3. **Bridge Logic**: Manages connections and data flow
-4. **Health Monitoring**: Monitors service connectivity
+Legacy helpers exist for building synthetic payloads from CometBFT block data but are not used in the current flow.
 
 ## 🐳 Docker Services
 
-The Docker setup includes:
+Compose brings up three services:
 
-- **ethbft-geth**: Ethereum execution client (Geth)
-- **ethbft-app**: EthBFT bridge application
-- **ethbft-cometbft**: CometBFT consensus node
+| Service | Purpose | Notes |
+|---------|---------|-------|
+| `ethbft-geth` | Geth execution client | Exposes HTTP (8545), WS (8546), Auth (8551) locally. |
+| `ethbft-app`  | EthBFT bridge | Uses mounted `jwt.hex` and `docker-config.yaml`. |
+| `ethbft-cometbft` | CometBFT node | ABCI connects to EthBFT on 8080. |
 
 ### Ports
 
-- `8545`: Geth HTTP RPC
-- `8546`: Geth WebSocket RPC
-- `8551`: Geth Engine API
-- `8080`: ABCI socket server
-- `8081`: Health check endpoint
-- `26656`: CometBFT P2P
-- `26657`: CometBFT RPC
+| Port | Service | Description |
+|------|---------|-------------|
+| 8545 | geth | HTTP JSON-RPC |
+| 8546 | geth | WebSocket RPC |
+| 8551 | geth | Engine API (authrpc) |
+| 8080 | ethbft | ABCI socket |
+| 8081 | ethbft | Health check `/health` |
+| 26656 | cometbft | P2P |
+| 26657 | cometbft | RPC |
 
-## 📊 Monitoring
+## 📊 Monitoring & Ops
 
 ### Health Check
 
@@ -178,7 +226,7 @@ docker-compose logs -f ethbft-geth
 
 ## 🛠️ Development
 
-### Available Commands
+### Available Make Targets
 
 ```bash
 # Build the application
@@ -236,16 +284,31 @@ CGO_ENABLED=0 GOOS=linux go build -o ethbft ./cmd/ethbft
    ```
 
 3. **Port Conflicts**
-   ```bash
-   # Check port usage
-   netstat -tulpn | grep :8080
-   
-   # Modify ports in docker-compose.yml
-   ```
+  ```bash
+  lsof -nP -iTCP:8080 -sTCP:LISTEN
+  # Edit docker-compose.yml or config.yaml to adjust.
+  ```
+
+4. **No Blocks Produced**
+  - Ensure `enableBridging: true`.
+  - Verify Engine API reachable: curl localhost:8551 (expect method not allowed / JSON error, not connection refused).
+  - Check JWT secret matches the one Geth was launched with.
+
+5. **Forkchoice Errors in Logs**
+  - Usually due to invalid parent hash (EL not ready). Wait until Geth has at least one head block, then EthBFT will retry at next poll.
+
+6. **CometBFT Endpoint Scheme**
+  - Local default uses `tcp://`; Docker config uses `http://` (required for JSON-RPC POST). Ensure config matches actual running node.
+
+## 🔐 Security Notes
+
+- Do NOT expose the Engine API (authrpc / 8551) to untrusted networks.
+- Current demo runs all components on a single host; multi‑validator / multi‑EL safety not considered.
+- JWT tokens are short‑lived (60s) and regenerated per Engine API call.
 
 ## 📝 License
 
-[MIT License](LICENSE)
+MIT (see `LICENSE` if present or to be added).
 
 ## 🤝 Contributing
 
@@ -261,6 +324,18 @@ Contributions are welcome! Please feel free to submit issues and pull requests.
 
 ## 📚 References
 
-- [CometBFT Documentation](https://docs.cometbft.com/)
-- [Ethereum Engine API](https://github.com/ethereum/execution-apis)
-- [ABCI Specification](https://docs.cometbft.com/v0.38/spec/abci/)
+- CometBFT Docs: https://docs.cometbft.com/
+- Ethereum Execution / Engine API: https://github.com/ethereum/execution-apis
+- ABCI Spec (v0.38): https://docs.cometbft.com/v0.38/spec/abci/
+- go-ethereum Engine Types: https://github.com/ethereum/go-ethereum/tree/master/beacon/engine
+
+---
+
+### Future Work (Roadmap Ideas)
+- Map CometBFT transactions into valid Ethereum transactions (RLP encoded) & submit via payload attributes.
+- Derive safe/finalized heads using height windows instead of equating all to head.
+- Multi‑node coordination / validator set syncing.
+- Metrics endpoint (Prometheus) and structured logging.
+- Pluggable transaction pool abstraction.
+
+Feedback & PRs welcome.
