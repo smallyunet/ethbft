@@ -59,49 +59,58 @@ func computeWithdrawalsRootEmpty() *common.Hash {
 // computeExecutionBlockHashWithGeth computes the block hash using go-ethereum's Header
 // This is the most robust implementation as it uses the exact same logic as geth
 func computeExecutionBlockHashWithGeth(p *ExecutionPayload) string {
+	// Determine nonce: genesis block (number 0 and zero parent) uses 0x42, otherwise zero
+	nonce := gethtypes.BlockNonce{}
+	if p.BlockNumber == "0x0" && p.ParentHash == zeroHash32() {
+		nonce = gethtypes.EncodeNonce(0x42)
+	}
+
+	// Optional header fields added in Shanghai/Deneb should be nil when not used
+	var withdrawalsHash *common.Hash
+	if len(p.Withdrawals) > 0 {
+		// For now support empty withdrawals only
+		withdrawalsHash = computeWithdrawalsRootEmpty()
+	}
+
+	var blobGasUsed *uint64
+	if p.BlobGasUsed != "" && p.BlobGasUsed != "0x" && p.BlobGasUsed != "0x0" {
+		val := hexToBig(p.BlobGasUsed).Uint64()
+		blobGasUsed = &val
+	}
+
+	var excessBlobGas *uint64
+	if p.ExcessBlobGas != "" && p.ExcessBlobGas != "0x" && p.ExcessBlobGas != "0x0" {
+		val := hexToBig(p.ExcessBlobGas).Uint64()
+		excessBlobGas = &val
+	}
+
+	var parentBeaconRoot *common.Hash
+	if p.ParentBeaconBlockRoot != "" && p.ParentBeaconBlockRoot != "0x" && p.ParentBeaconBlockRoot != zeroHash32() {
+		h := hexToHash(p.ParentBeaconBlockRoot)
+		parentBeaconRoot = &h
+	}
+
 	hdr := &gethtypes.Header{
-		ParentHash:  hexToHash(p.ParentHash),
-		UncleHash:   gethtypes.EmptyUncleHash, // Fixed after merge
-		Coinbase:    hexToAddress(p.FeeRecipient),
-		Root:        hexToHash(p.StateRoot),
-		TxHash:      computeTxRootFromBytesList(p.Transactions),
-		ReceiptHash: hexToHash(p.ReceiptsRoot),
-		Bloom:       gethtypes.Bloom{}, // Can parse from p.LogsBloom; empty for zero Bloom
-		Difficulty:  big.NewInt(0),
-		Number:      hexToBig(p.BlockNumber),
-		GasLimit:    hexToBig(p.GasLimit).Uint64(),
-		GasUsed:     hexToBig(p.GasUsed).Uint64(),
-		Time:        hexToBig(p.Timestamp).Uint64(),
-		Extra:       common.FromHex(p.ExtraData),
-		MixDigest:   hexToHash(p.PrevRandao), // post-merge uses prevRandao
-		Nonce:       gethtypes.BlockNonce{},  // 0
-		BaseFee:     hexToBig(p.BaseFeePerGas),
-		// EIP-4895 (withdrawals) / 4844 (blob) extension fields
-		// Note: Field names may vary slightly across different geth versions
-		WithdrawalsHash: computeWithdrawalsRootEmpty(),
-		BlobGasUsed: func() *uint64 {
-			if p.BlobGasUsed == "" || p.BlobGasUsed == "0x" || p.BlobGasUsed == "0x0" {
-				val := uint64(0)
-				return &val
-			}
-			val := hexToBig(p.BlobGasUsed).Uint64()
-			return &val
-		}(),
-		ExcessBlobGas: func() *uint64 {
-			if p.ExcessBlobGas == "" || p.ExcessBlobGas == "0x" || p.ExcessBlobGas == "0x0" {
-				val := uint64(0)
-				return &val
-			}
-			val := hexToBig(p.ExcessBlobGas).Uint64()
-			return &val
-		}(),
-		ParentBeaconRoot: func() *common.Hash {
-			if p.ParentBeaconBlockRoot == "" || p.ParentBeaconBlockRoot == "0x" {
-				return nil
-			}
-			h := hexToHash(p.ParentBeaconBlockRoot)
-			return &h
-		}(),
+		ParentHash:       hexToHash(p.ParentHash),
+		UncleHash:        gethtypes.EmptyUncleHash, // Fixed after merge
+		Coinbase:         hexToAddress(p.FeeRecipient),
+		Root:             hexToHash(p.StateRoot),
+		TxHash:           computeTxRootFromBytesList(p.Transactions),
+		ReceiptHash:      hexToHash(p.ReceiptsRoot),
+		Bloom:            gethtypes.Bloom{}, // p.LogsBloom is zero in our usage
+		Difficulty:       big.NewInt(0),
+		Number:           hexToBig(p.BlockNumber),
+		GasLimit:         hexToBig(p.GasLimit).Uint64(),
+		GasUsed:          hexToBig(p.GasUsed).Uint64(),
+		Time:             hexToBig(p.Timestamp).Uint64(),
+		Extra:            common.FromHex(p.ExtraData),
+		MixDigest:        hexToHash(p.PrevRandao), // post-merge uses prevRandao
+		Nonce:            nonce,
+		BaseFee:          hexToBig(p.BaseFeePerGas),
+		WithdrawalsHash:  withdrawalsHash,
+		BlobGasUsed:      blobGasUsed,
+		ExcessBlobGas:    excessBlobGas,
+		ParentBeaconRoot: parentBeaconRoot,
 	}
 
 	h := hdr.Hash()
