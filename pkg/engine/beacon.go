@@ -10,7 +10,7 @@ import (
 // Beacon API router
 
 func (s *Server) handleBeaconAPI(w http.ResponseWriter, r *http.Request) {
-	log.Printf("Beacon API request: %s %s", r.Method, r.URL.Path)
+    log.Printf("Beacon API request: %s %s", r.Method, r.URL.Path)
 
 	// Set CORS headers
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -23,12 +23,15 @@ func (s *Server) handleBeaconAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Readiness gate: all Beacon API endpoints return 503 until system ready
-	if !s.isReady() {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "service not ready"})
-		return
-	}
+    // Readiness gate: allow critical endpoints before full readiness
+    allowedPreReady := r.URL.Path == "/eth/v1/events" ||
+        r.URL.Path == "/eth/v1/beacon/headers/head" ||
+        strings.HasPrefix(r.URL.Path, "/eth/v1/beacon/light_client/")
+    if !allowedPreReady && !s.isReady() {
+        w.WriteHeader(http.StatusServiceUnavailable)
+        _ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "service not ready"})
+        return
+    }
 
 	// Handle different Beacon API endpoints (only reached when ready)
 	switch {

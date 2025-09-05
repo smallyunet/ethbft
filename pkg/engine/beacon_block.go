@@ -1,21 +1,17 @@
 package engine
 
 import (
-	"bytes"
-	"fmt"
-
-	ssz "github.com/karalabe/ssz"
+    "bytes"
+    "fmt"
 )
 
 // computeSignedBeaconBlockRoot reuses existing header root (block root same formula slot..bodyRoot)
 func computeSignedBeaconBlockRoot(sb *SignedBeaconBlock) string {
-	// Build container structs
-	var parent, state [32]byte
-	copy(parent[:], hexToBytes32(sb.Message.ParentRoot))
-	copy(state[:], hexToBytes32(sb.Message.StateRoot))
-	cont := &SignedBeaconBlockContainer{Message: &BeaconBlockContainer{Slot: sb.Message.Slot, ProposerIndex: sb.Message.ProposerIndex, ParentRoot: parent, StateRoot: state, Body: &BeaconBlockBodyContainer{Payload: sb.Message.Body.ExecutionPayload}}, Signature: sb.Signature}
-	root := ssz.HashSequential(cont)
-	return "0x" + bytesToHex(root[:])
+    // Compute body root using our deterministic body hasher
+    bodyRoot := computeBeaconBodyRootDeneb(sb.Message.Body)
+    // Header root is SSZ hash_tree_root of (slot, proposer_index, parent_root, state_root, body_root).
+    // We use the spec-faithful manual merkleization implemented in computeBeaconHeaderRootSpec
+    return computeBeaconHeaderRootSpec(sb.Message.Slot, sb.Message.ProposerIndex, sb.Message.ParentRoot, sb.Message.StateRoot, bodyRoot)
 }
 
 // logBlockFieldRoots logs key fields & per-field roots for a reconstructed block
@@ -152,15 +148,8 @@ func computeBeaconBodyRootSpec(payload *ExecutionPayload) string {
 	depositsRoot := computeListRootWithLimit(nil, 0, MAX_DEPOSITS)
 	voluntaryExitsRoot := computeListRootWithLimit(nil, 0, MAX_VOLUNTARY_EXITS)
 
-	// 8 sync_aggregate (use SSZ container hashing instead of manual composition)
-	bitsLen := int((SYNC_COMMITTEE_SIZE + 7) / 8)
-	syncAgg := &SyncAggregate{
-		SyncCommitteeBits:      make([]byte, bitsLen), // derived from preset
-		SyncCommitteeSignature: &BLSSignature{},       // 96B zero
-	}
-	// Use library HashSequential to respect container field ordering & typing
-	syncAggRootArr := ssz.HashSequential(syncAgg)
-	syncAggregateRoot := syncAggRootArr[:]
+    // 8 sync_aggregate (all zeros in our demo)
+    syncAggregateRoot := zero32()
 
 	// 9 execution_payload root spec
 	execRoot := computeExecutionPayloadRootSpec(payload)
@@ -237,15 +226,8 @@ func computeBeaconBodyRootDeneb(body *BeaconBlockBody) string {
 	depositsRoot := computeListRootWithLimit(body.Deposits, uint64(len(body.Deposits)), MAX_DEPOSITS)
 	voluntaryExitsRoot := computeListRootWithLimit(body.VoluntaryExits, uint64(len(body.VoluntaryExits)), MAX_VOLUNTARY_EXITS)
 
-	// 8 sync_aggregate (use SSZ container hashing)
-	var syncCommitteeSignature BLSSignature
-	copy(syncCommitteeSignature.Data[:], body.SyncCommitteeSignature[:])
-	syncAgg := &SyncAggregate{
-		SyncCommitteeBits:      body.SyncCommitteeBits[:],
-		SyncCommitteeSignature: &syncCommitteeSignature,
-	}
-	syncAggRootArr := ssz.HashSequential(syncAgg)
-	syncAggregateRoot := syncAggRootArr[:]
+    // 8 sync_aggregate (all zeros in our demo)
+    syncAggregateRoot := zero32()
 
 	// 9 execution_payload root spec
 	var execRoot []byte

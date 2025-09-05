@@ -285,32 +285,40 @@ func (s *Server) monitorBlocks() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	// Initial probe (do not create blocks until fully ready)
-	height, _, err := s.abciClient.GetLatestBlock(context.Background())
-	if err == nil {
-		s.readyMu.Lock()
-		s.cometReady = true
-		s.readyMu.Unlock()
-		s.blockMutex.Lock()
-		s.latestBlockHeight = height
-		s.blockMutex.Unlock()
-	}
+    // Initial probe: mark comet reachable but do not advance latestBlockHeight,
+    // so the first observed height will trigger block production.
+    if _, _, err := s.abciClient.GetLatestBlock(context.Background()); err == nil {
+        s.readyMu.Lock()
+        s.cometReady = true
+        s.readyMu.Unlock()
+        s.blockMutex.Lock()
+        // Start from -1 so first observed height (>=0) triggers block production
+        s.latestBlockHeight = -1
+        s.blockMutex.Unlock()
+    }
 
-	for {
-		<-ticker.C
-		h, _, err := s.abciClient.GetLatestBlock(context.Background())
-		if err != nil {
-			log.Printf("GetLatestBlock: %v", err)
-			s.readyMu.Lock()
-			s.cometReady = false
-			s.readyMu.Unlock()
-			continue
-		}
-		s.readyMu.Lock()
-		s.cometReady = true
-		s.readyMu.Unlock()
-		s.blockMutex.Lock()
-		if h > s.latestBlockHeight {
+    for {
+        <-ticker.C
+        h, _, err := s.abciClient.GetLatestBlock(context.Background())
+        if err != nil {
+            log.Printf("GetLatestBlock: %v", err)
+            s.readyMu.Lock()
+            s.cometReady = false
+            s.readyMu.Unlock()
+            continue
+        }
+        // Debug current height vs last
+        s.blockMutex.RLock()
+        last := s.latestBlockHeight
+        s.blockMutex.RUnlock()
+        if h < last {
+            log.Printf("MONITOR: non-monotonic CometBFT height h=%d < last=%d", h, last)
+        }
+        s.readyMu.Lock()
+        s.cometReady = true
+        s.readyMu.Unlock()
+        s.blockMutex.Lock()
+        if h > s.latestBlockHeight {
 			prevHead := s.headRoot
 			s.latestBlockHeight = h
 
