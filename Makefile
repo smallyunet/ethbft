@@ -36,7 +36,7 @@ deps:
 
 # Generate JWT secret for Engine API authentication
 generate-jwt:
-	openssl rand -hex 32 > jwt.hex
+	printf "%s" "$$(openssl rand -hex 32)" > jwt.hex
 	@echo "JWT secret generated at jwt.hex"
 
 # Create genesis.json file

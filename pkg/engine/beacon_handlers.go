@@ -99,7 +99,18 @@ func (s *Server) handleLightClientBootstrap(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "Invalid block root", http.StatusBadRequest)
 		return
 	}
-	_ = normalizeRoot(parts[len(parts)-1]) // normalized but not used; placeholder for future validation
+	reqRoot := normalizeRoot(parts[len(parts)-1])
+
+	// Only serve bootstrap for current head root (or known stored root); else 404 to let geth retry harmlessly
+	s.blockMutex.RLock()
+	headRoot := s.headRoot
+	_, known := s.rootSlots[reqRoot]
+	s.blockMutex.RUnlock()
+	if reqRoot != headRoot && !known {
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "unknown checkpoint root"})
+		return
+	}
 
 	s.blockMutex.RLock()
 	currentHeight := s.latestBlockHeight
@@ -732,11 +743,17 @@ func (s *Server) handleLightClientOptimisticUpdate(w http.ResponseWriter, r *htt
 		currentHash = zeroHash32()
 	}
 
+	// Ensure slot is never negative (use 0 for uninitialized state)
+	slot := currentHeight
+	if slot < 0 {
+		slot = 0
+	}
+
 	response := map[string]interface{}{
 		"data": map[string]interface{}{
 			"attested_header": map[string]interface{}{
 				"beacon": map[string]interface{}{
-					"slot":           strconv.FormatInt(currentHeight, 10),
+					"slot":           strconv.FormatInt(slot, 10),
 					"proposer_index": "0",
 					"parent_root":    "0x0000000000000000000000000000000000000000000000000000000000000000",
 					"state_root":     currentHash,

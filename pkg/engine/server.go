@@ -54,6 +54,10 @@ type Server struct {
 	gethReady    bool // at least one successful call to GetLatestExecutionStateRoot
 	cometReady   bool // at least one successful call to GetLatestBlock
 	presetLoaded bool // preset constants loaded
+
+	// Fallback synthetic production when CometBFT unreachable
+	syntheticMode   bool  // true if we're fabricating heights locally
+	syntheticHeight int64 // last synthetic height produced
 }
 
 // NewServer creates a new Engine API server
@@ -136,6 +140,43 @@ func NewServer(cfg *config.Config, abciClient ABCIClient) (*Server, error) {
 			server.lastValidExecHash = h
 			server.blockMutex.Unlock()
 			log.Printf("Initialized lastValidExecHash with actual EL genesis hash %s", h)
+		}
+	}()
+
+	// Attempt an initial forkchoiceUpdated pointing to genesis so EL is primed
+	go func() {
+		if server.ethClient == nil {
+			return
+		}
+		// Retry indefinitely (with backoff) until success so early slow geth startup does not block us permanently
+		for attempt := 1; ; attempt++ {
+			// Exponential-ish backoff capped at 15s
+			delay := time.Duration(2+attempt/3) * time.Second
+			if delay > 15*time.Second {
+				delay = 15 * time.Second
+			}
+			time.Sleep(delay)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			state := &ForkchoiceState{
+				HeadBlockHash:      server.lastValidExecHash,
+				SafeBlockHash:      server.lastValidExecHash,
+				FinalizedBlockHash: server.lastValidExecHash,
+			}
+			_, err := server.ethClient.Call(ctx, "engine_forkchoiceUpdatedV2", []interface{}{state})
+			cancel()
+			if err != nil {
+				// Classify common startup errors
+				if strings.Contains(err.Error(), "connection refused") {
+					log.Printf("initial forkchoice attempt %d: engine port not open yet (%v)", attempt, err)
+				} else if strings.Contains(err.Error(), "401") || strings.Contains(strings.ToLower(err.Error()), "unauthorized") {
+					log.Printf("initial forkchoice attempt %d: auth failed (JWT mismatch?) (%v)", attempt, err)
+				} else {
+					log.Printf("initial forkchoice attempt %d failed: %v", attempt, err)
+				}
+				continue
+			}
+			log.Printf("initial forkchoiceUpdated succeeded after %d attempts head=%s", attempt, state.HeadBlockHash)
+			break
 		}
 	}()
 
@@ -346,13 +387,31 @@ func (s *Server) monitorBlocks() {
 
 	for {
 		<-ticker.C
+		// Default: try real CometBFT first
 		h, _, err := s.abciClient.GetLatestBlock(context.Background())
 		if err != nil {
-			log.Printf("GetLatestBlock: %v", err)
+			// Enable synthetic mode
+			if !s.syntheticMode {
+				log.Printf("GetLatestBlock error (%v) -> entering synthetic production mode", err)
+			}
+			s.syntheticMode = true
+			// Derive next synthetic height
+			s.blockMutex.RLock()
+			curr := s.latestBlockHeight
+			s.blockMutex.RUnlock()
+			if curr < 0 {
+				curr = -1
+			}
+			h = curr + 1
+		} else {
+			// Successful real height fetch; if we were synthetic, exit mode
+			if s.syntheticMode {
+				log.Printf("Recovered CometBFT connectivity at height=%d, leaving synthetic mode", h)
+			}
+			s.syntheticMode = false
 			s.readyMu.Lock()
-			s.cometReady = false
+			s.cometReady = true
 			s.readyMu.Unlock()
-			continue
 		}
 		// Debug current height vs last
 		s.blockMutex.RLock()
@@ -361,9 +420,12 @@ func (s *Server) monitorBlocks() {
 		if h < last {
 			log.Printf("MONITOR: non-monotonic CometBFT height h=%d < last=%d", h, last)
 		}
-		s.readyMu.Lock()
-		s.cometReady = true
-		s.readyMu.Unlock()
+		// If synthetic mode, mark cometReady false (unless prior success) but still allow production via gethReady path.
+		if s.syntheticMode {
+			s.readyMu.Lock()
+			s.cometReady = false
+			s.readyMu.Unlock()
+		}
 		s.blockMutex.Lock()
 		// Decide whether to produce a block for this tick.
 		shouldProduce := false
@@ -449,13 +511,55 @@ func (s *Server) monitorBlocks() {
 					GasUsed:               "0x0",
 					Timestamp:             fmt.Sprintf("0x%x", ts),
 					ExtraData:             "0x",
-					BaseFeePerGas:         "0x0",
+					BaseFeePerGas:         "0x0", // temporary, will be replaced below
 					Transactions:          []string{},
 					Withdrawals:           []string{},
 					BlobGasUsed:           "0x0",
 					ExcessBlobGas:         "0x0",
 					ParentBeaconBlockRoot: s.headRoot,
 				}
+
+				// Determine BaseFeePerGas using parent block (or previous payload) for validity
+				parentBaseFee := "0x0"
+				if h == 0 {
+					// Query genesis block for base fee
+					if s.ethClient != nil {
+						ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+						if res, err := s.ethClient.Call(ctx2, "eth_getBlockByNumber", []interface{}{"0x0", false}); err == nil {
+							var blk map[string]interface{}
+							if json.Unmarshal(res, &blk) == nil {
+								if bf, ok := blk["baseFeePerGas"].(string); ok && strings.HasPrefix(bf, "0x") {
+									parentBaseFee = bf
+								}
+								// Also reuse genesis state root if we have none (ensure EL acceptance for empty block)
+								if sr, ok := blk["stateRoot"].(string); ok && strings.HasPrefix(sr, "0x") {
+									payloadForSlot.StateRoot = sr
+								}
+							}
+						} else {
+							log.Printf("base fee genesis fetch error: %v", err)
+						}
+						cancel2()
+					}
+				} else if pPrev, ok := s.payloadsBySlot[h-1]; ok && pPrev.BaseFeePerGas != "" {
+					parentBaseFee = pPrev.BaseFeePerGas
+					// Attempt to query parent block to inherit accurate state root (empty blocks stay constant)
+					if s.ethClient != nil {
+						parentExecNum := fmt.Sprintf("0x%x", h) // parent execution number (h maps to BlockNumber h for previous payload since we add +1)
+						ctx3, cancel3 := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+						if res, err := s.ethClient.Call(ctx3, "eth_getBlockByNumber", []interface{}{parentExecNum, false}); err == nil {
+							var blk map[string]interface{}
+							if json.Unmarshal(res, &blk) == nil {
+								if sr, ok := blk["stateRoot"].(string); ok && strings.HasPrefix(sr, "0x") {
+									payloadForSlot.StateRoot = sr
+								}
+							}
+						}
+						cancel3()
+					}
+				}
+				// For empty block, EIP-1559 formula keeps base fee ~ parent (no gas used change). Use same.
+				payloadForSlot.BaseFeePerGas = parentBaseFee
 
 				payloadForSlot.BlockHash = computeExecutionBlockHash(payloadForSlot)
 				s.payloadsBySlot[h] = payloadForSlot
@@ -530,6 +634,8 @@ func (s *Server) pushToGeth(payload *ExecutionPayload) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
+
+	log.Printf("ENGINE_PUSH: submitting payload parent=%s number=%s stateRoot=%s blockHash=%s ts=%s", payload.ParentHash, payload.BlockNumber, payload.StateRoot, payload.BlockHash, payload.Timestamp)
 
 	// Record the payload in the ABCI application to keep ABCI/AppHash in sync
 	if s.abciClient != nil && payload != nil {

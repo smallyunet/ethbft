@@ -18,6 +18,14 @@ else
   echo "[start-geth] WARNING: Genesis file not found at $GENESIS; skipping init"
 fi
 
+echo "[start-geth] Geth version:" && geth version || true
+if [ -f /jwt.hex ]; then
+  echo "[start-geth] JWT file size: $(wc -c < /jwt.hex) bytes (expect 64)"
+  head -c 64 /jwt.hex >/dev/null 2>&1 || true
+else
+  echo "[start-geth] WARNING: /jwt.hex not found inside container"
+fi
+
 echo "[start-geth] Starting geth with args: $*"
 exec geth "$@"
 

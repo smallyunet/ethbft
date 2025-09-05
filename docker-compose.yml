@@ -1,12 +1,14 @@
 services:
   geth:
-    image: ethereum/client-go:latest
+    image: ethereum/client-go:v1.15.11
     container_name: ethbft-geth
     entrypoint: ["/start-geth.sh"]
+    restart: unless-stopped
     ports:
       - "8545:8545"   # HTTP RPC
       - "8546:8546"   # WebSocket RPC
       - "30303:30303" # P2P
+      - "8551:8551"   # Engine API (authrpc)
     volumes:
       - ./jwt.hex:/jwt.hex
       - ./geth_data:/root/.ethereum
@@ -16,6 +18,7 @@ services:
       - --networkid=1337
       - --nodiscover
       - --datadir=/root/.ethereum
+      - --verbosity=3
       - --http
       - --http.addr=0.0.0.0
       - --http.port=8545
@@ -29,45 +32,36 @@ services:
       - --ws.origins=*
       - --syncmode=full
       - --gcmode=archive
-      - --txlookuplimit=0
+      - --history.transactions=0 
       - --authrpc.addr=0.0.0.0
       - --authrpc.port=8551
       - --authrpc.jwtsecret=/jwt.hex
       - --authrpc.vhosts=*
-      - --beacon.api=http://ethbft:8551
-      - --verbosity=3
-    restart: unless-stopped
 
   ethbft:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: ethbft-app
+    restart: unless-stopped
+    depends_on:
+      - geth
     ports:
       - "8080:8080" # ABCI socket
       - "8081:8081" # Health check
-      - "8551:8551" # Engine API server
+      # Removed 8551 port mapping - only Geth should expose Engine API
     volumes:
       - ./config/docker-config.yaml:/app/config.yaml
       - ./jwt.hex:/app/jwt.hex
     environment:
       - ETHBFT_CONFIG=/app/config.yaml
-    depends_on:
-      - geth
-    # Healthcheck ensures cometbft starts only after ethbft is ready
-    healthcheck:
-      test: ["CMD", "sh", "-c", "nc -z 127.0.0.1 8081 || nc -z 127.0.0.1 8080"]
-      interval: 2s
-      timeout: 1s
-      retries: 60
-    restart: unless-stopped
 
   cometbft:
     image: cometbft/cometbft:v0.38.17
     container_name: ethbft-cometbft
+    restart: unless-stopped
     depends_on:
-      ethbft:
-        condition: service_healthy
+      - ethbft
     entrypoint: ["/start-cometbft.sh"]
     ports:
       - "26656:26656"
@@ -75,4 +69,3 @@ services:
     volumes:
       - ./cometbft_home:/cometbft
       - ./scripts/start-cometbft.sh:/start-cometbft.sh
-    restart: unless-stopped
