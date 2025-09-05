@@ -97,28 +97,32 @@ func (s *Server) handleLightClientBootstrap(w http.ResponseWriter, r *http.Reque
 	stateRoot := currentHash
 	bodyRoot := "0x0000000000000000000000000000000000000000000000000000000000000000"
 
-	response := map[string]interface{}{
-		"data": map[string]interface{}{
-			"header": map[string]interface{}{
-				"beacon": map[string]interface{}{
-					"slot":           strconv.FormatInt(currentHeight, 10),
-					"proposer_index": "0",
-					"parent_root":    parentRoot,
-					"state_root":     stateRoot,
-					"body_root":      bodyRoot,
-				},
-			},
-			"current_sync_committee": map[string]interface{}{
-				"pubkeys": []string{
-					"0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-				},
-				"aggregate_pubkey": "0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-			},
-			"current_sync_committee_branch": []string{
-				"0x0000000000000000000000000000000000000000000000000000000000000000",
-			},
-		},
-	}
+    // Build a dummy sync committee of correct size (SYNC_COMMITTEE_SIZE), all zeroed
+    pubkeys := make([]string, SYNC_COMMITTEE_SIZE)
+    zeroPub := "0x" + strings.Repeat("0", 96)
+    for i := range pubkeys {
+        pubkeys[i] = zeroPub
+    }
+    response := map[string]interface{}{
+        "data": map[string]interface{}{
+            "header": map[string]interface{}{
+                "beacon": map[string]interface{}{
+                    "slot":           strconv.FormatInt(currentHeight, 10),
+                    "proposer_index": "0",
+                    "parent_root":    parentRoot,
+                    "state_root":     stateRoot,
+                    "body_root":      bodyRoot,
+                },
+            },
+            "current_sync_committee": map[string]interface{}{
+                "pubkeys": pubkeys,
+                "aggregate_pubkey": zeroPub,
+            },
+            "current_sync_committee_branch": []string{
+                "0x0000000000000000000000000000000000000000000000000000000000000000",
+            },
+        },
+    }
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)

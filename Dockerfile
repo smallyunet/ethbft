@@ -22,8 +22,8 @@ FROM alpine:3.17
 
 WORKDIR /app
 
-# Install runtime dependencies
-RUN apk add --no-cache ca-certificates
+# Install runtime dependencies (add netcat for docker healthcheck)
+RUN apk add --no-cache ca-certificates netcat-openbsd
 
 # Copy binary from builder stage
 COPY --from=builder /build/ethbft /app/ethbft

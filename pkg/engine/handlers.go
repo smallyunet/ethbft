@@ -89,20 +89,24 @@ func (s *Server) handleForkchoiceUpdated(params json.RawMessage) (interface{}, e
 }
 
 func (s *Server) handleGetPayload(params json.RawMessage) (interface{}, error) {
-	var payloadId string
-	if err := json.Unmarshal(params, &[]interface{}{&payloadId}); err != nil {
-		return nil, fmt.Errorf("invalid params: %v", err)
-	}
+    var payloadId string
+    if err := json.Unmarshal(params, &[]interface{}{&payloadId}); err != nil {
+        return nil, fmt.Errorf("invalid params: %v", err)
+    }
 
-	log.Printf("Getting payload for ID: %s", payloadId)
+    log.Printf("Getting payload for ID: %s", payloadId)
 
-	// Get payload from ABCI
-	payload, err := s.abciClient.GetPendingPayload(context.Background())
-	if err != nil {
-		return nil, fmt.Errorf("failed to get payload: %v", err)
-	}
+    // Prefer the locally constructed payload used for the latest beacon block
+    if p := s.LatestLocalPayload(); p != nil {
+        return p, nil
+    }
 
-	return payload, nil
+    // Fallback to ABCI client
+    payload, err := s.abciClient.GetPendingPayload(context.Background())
+    if err != nil {
+        return nil, fmt.Errorf("failed to get payload: %v", err)
+    }
+    return payload, nil
 }
 
 func (s *Server) handleExchangeTransitionConfiguration(params json.RawMessage) (interface{}, error) {

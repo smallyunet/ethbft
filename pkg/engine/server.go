@@ -12,13 +12,15 @@ import (
 	"time"
 
 	"github.com/smallyunet/ethbft/pkg/config"
+    "github.com/smallyunet/ethbft/pkg/ethereum"
 )
 
 // Server implements the Engine API server that acts as a mock beacon client for Geth
 type Server struct {
-	config     *config.Config
-	httpServer *http.Server
-	jwtSecret  string
+    config     *config.Config
+    httpServer *http.Server
+    jwtSecret  string
+    ethClient  *ethereum.Client
 
 	// State tracking
 	latestPayload   *ExecutionPayload
@@ -37,8 +39,8 @@ type Server struct {
 	headerData        map[string]beaconHeaderFields // header root -> fields
 	payloadsBySlot    map[int64]*ExecutionPayload   // slot -> execution payload used for body root
 	blockSSZByRoot    map[string][]byte             // header root -> persisted SSZ bytes (only trusted source)
-	blockJSONByRoot   map[string][]byte             // header root -> pre-built beacon block JSON response (stable)
-	blockMutex        sync.RWMutex
+    blockJSONByRoot   map[string][]byte             // header root -> pre-built beacon block JSON response (stable)
+    blockMutex        sync.RWMutex
 
 	// Event stream clients
 	eventClients    map[chan []byte]bool
@@ -64,15 +66,22 @@ func NewServer(cfg *config.Config, abciClient ABCIClient) (*Server, error) {
 		}
 	}
 
-	server := &Server{
-		config:     cfg,
-		jwtSecret:  jwtSecret,
-		abciClient: abciClient,
-		forkchoiceState: &ForkchoiceState{
-			HeadBlockHash:      "0x0000000000000000000000000000000000000000000000000000000000000000",
-			SafeBlockHash:      "0x0000000000000000000000000000000000000000000000000000000000000000",
-			FinalizedBlockHash: "0x0000000000000000000000000000000000000000000000000000000000000000",
-		},
+    // Create an Ethereum client for Engine API outbound calls
+    ethCli, err := ethereum.NewClient(cfg)
+    if err != nil {
+        log.Printf("Warning: failed to create Ethereum engine client: %v", err)
+    }
+
+    server := &Server{
+        config:     cfg,
+        jwtSecret:  jwtSecret,
+        ethClient:  ethCli,
+        abciClient: abciClient,
+        forkchoiceState: &ForkchoiceState{
+            HeadBlockHash:      "0x0000000000000000000000000000000000000000000000000000000000000000",
+            SafeBlockHash:      "0x0000000000000000000000000000000000000000000000000000000000000000",
+            FinalizedBlockHash: "0x0000000000000000000000000000000000000000000000000000000000000000",
+        },
 		eventClients:    make(map[chan []byte]bool),
 		slotRoots:       make(map[int64]string),
 		rootSlots:       make(map[string]int64),
@@ -102,7 +111,23 @@ func NewServer(cfg *config.Config, abciClient ABCIClient) (*Server, error) {
 		}
 	}()
 
-	return server, nil
+    return server, nil
+}
+
+// LatestLocalPayload returns the most recently built execution payload
+// used to construct the latest beacon body/header. This avoids any
+// accidental divergence between what we return to geth and what we
+// embed into SSZ/ABCI.
+func (s *Server) LatestLocalPayload() *ExecutionPayload {
+    s.blockMutex.RLock()
+    defer s.blockMutex.RUnlock()
+    if s.latestBlockHeight > 0 {
+        if p, ok := s.payloadsBySlot[s.latestBlockHeight]; ok {
+            return p
+        }
+    }
+    // Fallback to last seen payload if any
+    return s.latestPayload
 }
 
 // storeRootToBytes stores SSZ bytes for a beacon block root (only trusted source)
@@ -289,22 +314,37 @@ func (s *Server) monitorBlocks() {
 			prevHead := s.headRoot
 			s.latestBlockHeight = h
 
-			// Attempt to get execution state root; if fail, mark not ready & skip block production
-			execStateRoot, err := s.abciClient.GetLatestExecutionStateRoot(context.Background())
-			if err != nil {
-				log.Printf("GetLatestExecutionStateRoot failed (will not fallback): %v", err)
-				s.readyMu.Lock()
-				s.gethReady = false
-				s.readyMu.Unlock()
-				s.blockMutex.Unlock()
-				continue
-			}
-			stateRoot := normalizeRoot(execStateRoot)
-			s.readyMu.Lock()
-			s.gethReady = true
-			readyNow := s.gethReady && s.cometReady && s.presetLoaded
-			s.readyMu.Unlock()
-			s.latestBlockHash = stateRoot
+            // Attempt to get execution state root; if fail, fallback to previous or zero to bootstrap
+            execStateRoot, err := s.abciClient.GetLatestExecutionStateRoot(context.Background())
+            var stateRoot string
+            if err != nil {
+                log.Printf("GetLatestExecutionStateRoot failed (fallback to previous/zero): %v", err)
+                // Fallback: use last known execution hash if any, else zero
+                if s.latestBlockHash != "" {
+                    stateRoot = s.latestBlockHash
+                } else {
+                    stateRoot = zeroHash32()
+                }
+                // Probe geth basic reachability to set readiness signal
+                if s.ethClient != nil {
+                    ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+                    _, pingErr := s.ethClient.Call(ctx, "eth_blockNumber", []interface{}{})
+                    cancel()
+                    s.readyMu.Lock()
+                    s.gethReady = (pingErr == nil)
+                    s.readyMu.Unlock()
+                }
+            } else {
+                stateRoot = normalizeRoot(execStateRoot)
+                s.readyMu.Lock()
+                s.gethReady = true
+                s.readyMu.Unlock()
+            }
+            // Compute readiness for block production using comet + preset only
+            s.readyMu.RLock()
+            readyNow := s.cometReady && s.presetLoaded
+            s.readyMu.RUnlock()
+            s.latestBlockHash = stateRoot
 
 			parent := prevHead
 			if parent == "" {
@@ -360,11 +400,11 @@ func (s *Server) monitorBlocks() {
 				s.payloadsBySlot[h] = payloadForSlot
 			}
 
-			// Create complete BeaconBlockBody with ExecutionPayload and default values for other fields
-			body := &BeaconBlockBody{
-				ExecutionPayload: payloadForSlot,
-				// All other fields are zero/empty by default which is correct for our demo
-			}
+            // Create complete BeaconBlockBody with ExecutionPayload and default values for other fields
+            body := &BeaconBlockBody{
+                ExecutionPayload: payloadForSlot,
+                // All other fields are zero/empty by default which is correct for our demo
+            }
 			bodyRoot := computeBeaconBodyRootDeneb(body)
 			blk := &SignedBeaconBlock{
 				Message: &BeaconBlock{
@@ -383,7 +423,7 @@ func (s *Server) monitorBlocks() {
 				continue
 			}
 			hdr := beaconHeaderFields{Slot: h, ParentRoot: parent, StateRoot: s.latestBlockHash, BodyRoot: bodyRoot}
-			s.storeBlock(h, newRoot, sszBytes, hdr, payloadForSlot)
+            s.storeBlock(h, newRoot, sszBytes, hdr, payloadForSlot)
 
 			// Verify recomputation stability
 			if recompute := computeBeaconBodyRootDeneb(body); recompute != bodyRoot {
@@ -407,20 +447,91 @@ func (s *Server) monitorBlocks() {
 			log.Printf("BLOCK_PROCESS:   - body_root: %s", bodyRoot)
 			log.Printf("BLOCK_PROCESS:   - computed_beacon_root: %s", newRoot)
 			log.Printf("BLOCK_PROCESS: This beacon root will be used when Geth requests beacon block data")
-			s.blockMutex.Unlock()
-			log.Printf("New block: height=%d headerRoot=%s execHash=%s", h, s.headRoot, s.latestBlockHash)
-			s.broadcastHeadEvent(h, s.headRoot)
-		} else {
-			s.blockMutex.Unlock()
-		}
-	}
+            s.blockMutex.Unlock()
+            log.Printf("New block: height=%d headerRoot=%s execHash=%s", h, s.headRoot, s.latestBlockHash)
+            s.broadcastHeadEvent(h, s.headRoot)
+
+            // Push execution payload and forkchoice to Geth via Engine API
+            go s.pushToGeth(payloadForSlot)
+        } else {
+            s.blockMutex.Unlock()
+        }
+    }
+}
+
+// pushToGeth submits the new payload and updates forkchoice on the EL
+func (s *Server) pushToGeth(payload *ExecutionPayload) {
+    if s.ethClient == nil {
+        log.Printf("Engine push skipped: Ethereum client unavailable")
+        return
+    }
+    ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+    defer cancel()
+
+    // Record the payload in the ABCI application to keep ABCI/AppHash in sync
+    if s.abciClient != nil && payload != nil {
+        if err := s.abciClient.ExecutePayload(context.Background(), payload); err != nil {
+            log.Printf("warning: abci ExecutePayload failed: %v", err)
+        }
+    }
+
+    // Try V3 -> V2 -> V1
+    var resp json.RawMessage
+    var err error
+    if resp, err = s.ethClient.Call(ctx, "engine_newPayloadV3", []interface{}{payload}); err != nil {
+        log.Printf("engine_newPayloadV3 error: %v", err)
+        if resp, err = s.ethClient.Call(ctx, "engine_newPayloadV2", []interface{}{payload}); err != nil {
+            log.Printf("engine_newPayloadV2 error: %v", err)
+            if resp, err = s.ethClient.Call(ctx, "engine_newPayloadV1", []interface{}{payload}); err != nil {
+                log.Printf("engine_newPayloadV1 error: %v", err)
+                return
+            }
+        }
+    }
+    // Log status field if present
+    var status struct {
+        Status          string  `json:"status"`
+        LatestValidHash *string `json:"latestValidHash"`
+        ValidationError *string `json:"validationError"`
+    }
+    if err := json.Unmarshal(resp, &status); err == nil && status.Status != "" {
+        log.Printf("engine_newPayload status=%s latestValid=%v error=%v", status.Status, status.LatestValidHash, status.ValidationError)
+    } else {
+        log.Printf("engine_newPayload raw response: %s", string(resp))
+    }
+
+    // Update forkchoice to set the new head/safe/finalized to this payload (demo behavior)
+    state := &ForkchoiceState{
+        HeadBlockHash:      payload.BlockHash,
+        SafeBlockHash:      payload.BlockHash,
+        FinalizedBlockHash: payload.BlockHash,
+    }
+    if resp, err = s.ethClient.Call(ctx, "engine_forkchoiceUpdatedV2", []interface{}{state}); err != nil {
+        log.Printf("engine_forkchoiceUpdatedV2 error: %v", err)
+    } else {
+        var fcr struct {
+            PayloadStatus struct {
+                Status          string  `json:"status"`
+                LatestValidHash *string `json:"latestValidHash"`
+                ValidationError *string `json:"validationError"`
+            } `json:"payloadStatus"`
+            PayloadId *string `json:"payloadId"`
+        }
+        if err := json.Unmarshal(resp, &fcr); err == nil && fcr.PayloadStatus.Status != "" {
+            log.Printf("engine_forkchoiceUpdatedV2 status=%s latestValid=%v payloadId=%v error=%v", fcr.PayloadStatus.Status, fcr.PayloadStatus.LatestValidHash, fcr.PayloadId, fcr.PayloadStatus.ValidationError)
+        } else {
+            log.Printf("engine_forkchoiceUpdatedV2 raw response: %s", string(resp))
+        }
+    }
 }
 
 // Readiness helpers
 func (s *Server) isReady() bool {
-	s.readyMu.RLock()
-	defer s.readyMu.RUnlock()
-	return s.gethReady && s.cometReady && s.presetLoaded
+    s.readyMu.RLock()
+    defer s.readyMu.RUnlock()
+    // Consider service ready as soon as CometBFT is reachable and presets are loaded,
+    // so Beacon API endpoints and event stream can start for Geth to subscribe.
+    return s.cometReady && s.presetLoaded
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {

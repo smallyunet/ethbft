@@ -10,16 +10,20 @@ import (
 	"os"
 	"strings"
 	"time"
+    "crypto/hmac"
+    "crypto/sha256"
+    "encoding/base64"
+    "encoding/hex"
 
 	"github.com/smallyunet/ethbft/pkg/config"
 )
 
 // Client represents an Ethereum execution client adapter
 type Client struct {
-	config          *config.Config
-	httpClient      *http.Client
-	engineAPIClient *http.Client // Dedicated client for Engine API
-	jwtSecret       string       // JWT secret key
+    config          *config.Config
+    httpClient      *http.Client
+    engineAPIClient *http.Client // Dedicated client for Engine API
+    jwtSecret       string       // JWT secret key
 }
 
 // NewClient creates a new Ethereum client
@@ -121,13 +125,14 @@ func (c *Client) Call(ctx context.Context, method string, params interface{}) (j
 
 	req.Header.Set("Content-Type", "application/json")
 
-	// Add JWT authentication for Engine API calls
-	if isEngineAPI && c.jwtSecret != "" {
-		log.Printf("Adding JWT auth header using hex key")
-		// Note: Using the hex key string directly as token
-		// Geth expects the hex string itself, not standard JWT
-		req.Header.Set("Authorization", "Bearer "+c.jwtSecret)
-	}
+    // Add JWT authentication for Engine API calls (HS256 as per Engine API spec)
+    if isEngineAPI && c.jwtSecret != "" {
+        if token, err := c.generateJWT(); err != nil {
+            return nil, fmt.Errorf("failed to generate JWT: %w", err)
+        } else {
+            req.Header.Set("Authorization", "Bearer "+token)
+        }
+    }
 
 	// Choose the correct client
 	client := c.httpClient
@@ -177,7 +182,37 @@ func (c *Client) Call(ctx context.Context, method string, params interface{}) (j
 		return nil, fmt.Errorf("JSON-RPC error: %d %s", response.Error.Code, response.Error.Message)
 	}
 
-	return response.Result, nil
+    return response.Result, nil
+}
+
+// generateJWT builds a short-lived HS256 JWT using the hex-encoded secret
+func (c *Client) generateJWT() (string, error) {
+    // Decode hex secret into raw bytes
+    key, err := hex.DecodeString(strings.TrimPrefix(strings.TrimSpace(c.jwtSecret), "0x"))
+    if err != nil {
+        return "", fmt.Errorf("invalid jwt secret hex: %w", err)
+    }
+
+    // Header and payload
+    header := `{"alg":"HS256","typ":"JWT"}`
+    now := time.Now().Unix()
+    // Keep token lifetime short (e.g., 60s)
+    payload := fmt.Sprintf(`{"iat":%d,"exp":%d}`, now, now+60)
+
+    // Base64 URL encode without padding
+    enc := func(b []byte) string {
+        return strings.TrimRight(base64.URLEncoding.EncodeToString(b), "=")
+    }
+    headEnc := enc([]byte(header))
+    payEnc := enc([]byte(payload))
+    signingInput := headEnc + "." + payEnc
+
+    mac := hmac.New(sha256.New, key)
+    mac.Write([]byte(signingInput))
+    sig := mac.Sum(nil)
+    sigEnc := enc(sig)
+
+    return signingInput + "." + sigEnc, nil
 }
 
 // CheckConnection verifies connectivity to the Ethereum client

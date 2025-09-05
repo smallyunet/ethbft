@@ -2,6 +2,7 @@ services:
   geth:
     image: ethereum/client-go:latest
     container_name: ethbft-geth
+    entrypoint: ["/start-geth.sh"]
     ports:
       - "8545:8545"   # HTTP RPC
       - "8546:8546"   # WebSocket RPC
@@ -10,6 +11,7 @@ services:
       - ./jwt.hex:/jwt.hex
       - ./geth_data:/root/.ethereum
       - ./geth_data/genesis.json:/genesis.json
+      - ./scripts/start-geth.sh:/start-geth.sh
     command:
       - --networkid=1337
       - --nodiscover
@@ -74,4 +76,3 @@ services:
       - ./cometbft_home:/cometbft
       - ./scripts/start-cometbft.sh:/start-cometbft.sh
     restart: unless-stopped
-
