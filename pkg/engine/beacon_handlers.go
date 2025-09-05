@@ -52,7 +52,7 @@ func (s *Server) handleBeaconState(w http.ResponseWriter, r *http.Request) {
 	response.Data.GenesisTime = "0"
 	// Use proper Ethereum fork versions - these are the actual fork versions used by Ethereum
 	response.Data.GenesisForkVersion = "0x00000000"
-	response.Data.CurrentForkVersion = "0x02000000" // Bellatrix fork version
+	response.Data.CurrentForkVersion = "0x04000000" // Deneb
 	response.Data.Slot = strconv.FormatInt(currentHeight, 10)
 	response.Data.Epoch = strconv.FormatInt(currentHeight/32, 10) // Assuming 32 slots per epoch
 	response.Data.FinalizedCheckpoint.Epoch = strconv.FormatInt(currentHeight/32, 10)
@@ -195,7 +195,7 @@ func (s *Server) handleBeaconBlock(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Extract header fields from unmarshaled block
-		bodyRoot := computeBeaconBodyRootSpec(blk.Message.Body.ExecutionPayload)
+		bodyRoot := computeBeaconBodyRootDeneb(blk.Message.Body)
 		hdrFields = beaconHeaderFields{
 			Slot:       int64(blk.Message.Slot),
 			ParentRoot: blk.Message.ParentRoot,
@@ -320,7 +320,9 @@ func (s *Server) handleBeaconHeader(w http.ResponseWriter, r *http.Request) {
 		s.blockMutex.RLock()
 		execStateRoot := s.latestBlockHash // This should be the execution state root
 		s.blockMutex.RUnlock()
-		bodyRoot := computeBeaconBodyRootWithStateRoot(&ExecutionPayload{
+
+		// Create a complete BeaconBlockBody for proper SSZ computation
+		fallbackPayload := &ExecutionPayload{
 			StateRoot:     execStateRoot,
 			BlockNumber:   fmt.Sprintf("0x%x", slot),
 			Timestamp:     "0x0",
@@ -335,7 +337,12 @@ func (s *Server) handleBeaconHeader(w http.ResponseWriter, r *http.Request) {
 			BaseFeePerGas: "0x0",
 			BlockHash:     "0x0000000000000000000000000000000000000000000000000000000000000000",
 			Transactions:  []string{},
-		})
+		}
+		body := &BeaconBlockBody{
+			ExecutionPayload: fallbackPayload,
+			// All other fields are zero/empty by default
+		}
+		bodyRoot := computeBeaconBodyRootDeneb(body)
 		hdrFields2 = beaconHeaderFields{Slot: slot, ParentRoot: zeroHash32(), StateRoot: execStateRoot, BodyRoot: bodyRoot}
 		log.Printf("WARNING: Header data not found for root %s in handleBeaconHeader, using fallback with execStateRoot %s", root, execStateRoot)
 	}
@@ -384,43 +391,27 @@ func (s *Server) handleBeaconBlockV2(w http.ResponseWriter, r *http.Request) {
 	}
 	s.blockMutex.RUnlock()
 
-	var (
-		slot  int64
-		root  string
-		found bool
-	)
-	s.blockMutex.RLock()
+	var root string
 	if id == "head" {
-		slot = s.latestBlockHeight
+		s.blockMutex.RLock()
 		root = s.headRoot
-		found = true
+		s.blockMutex.RUnlock()
 	} else if strings.HasPrefix(id, "0x") {
-		if sl, ok := s.rootSlots[normalizeRoot(id)]; ok {
-			slot = sl
-			root = normalizeRoot(id)
-			found = true
-		}
+		root = normalizeRoot(id)
 	} else if n, err := strconv.ParseInt(id, 10, 64); err == nil {
+		s.blockMutex.RLock()
 		if rt, ok := s.slotRoots[n]; ok {
-			slot = n
 			root = rt
-			found = true
 		}
+		s.blockMutex.RUnlock()
+	} else {
+		http.Error(w, "Invalid block ID", http.StatusBadRequest)
+		return
 	}
-	s.blockMutex.RUnlock()
-	if !found {
+	if root == "" {
 		http.Error(w, "Block not found", http.StatusNotFound)
 		return
 	}
-	// Defensive insert
-	s.blockMutex.Lock()
-	if _, ok := s.rootSlots[root]; !ok {
-		s.rootSlots[root] = slot
-	}
-	if _, ok := s.slotRoots[slot]; !ok {
-		s.slotRoots[slot] = root
-	}
-	s.blockMutex.Unlock()
 
 	// Retrieve stored SSZ bytes (only trusted source)
 	sszBytes, ok := s.loadBytesByRoot(root)
@@ -430,7 +421,7 @@ func (s *Server) handleBeaconBlockV2(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Unmarshal ONLY for self-check and JSON conversion
+	// Unmarshal ONLY for JSON conversion (persisted SSZ is single source of truth)
 	blk, err := unmarshalSignedBeaconBlockSSZ(sszBytes)
 	if err != nil {
 		log.Printf("UNMARSHAL_ERROR: root=%s err=%v", root, err)
@@ -439,7 +430,7 @@ func (s *Server) handleBeaconBlockV2(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Self-check A: body_root
-	bodyRoot := computeBeaconBodyRootSpec(blk.Message.Body.ExecutionPayload)
+	bodyRoot := computeBeaconBodyRootDeneb(blk.Message.Body)
 	// Header root recompute & compare (block root)
 	recalcRoot := computeSignedBeaconBlockRoot(blk)
 	if recalcRoot != root {
@@ -651,7 +642,7 @@ func (s *Server) handleBeaconStateByState(w http.ResponseWriter, r *http.Request
 			"genesis_validators_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
 			"genesis_time":            "0",
 			"genesis_fork_version":    "0x00000000",
-			"current_fork_version":    "0x02000000", // Bellatrix fork version
+			"current_fork_version":    "0x04000000", // Deneb
 			"slot":                    stateId,
 			"epoch":                   strconv.FormatInt(currentHeight/32, 10),
 			"finalized_checkpoint": map[string]interface{}{

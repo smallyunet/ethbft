@@ -23,7 +23,14 @@ func (s *Server) handleBeaconAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Handle different Beacon API endpoints
+	// Readiness gate: all Beacon API endpoints return 503 until system ready
+	if !s.isReady() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "service not ready"})
+		return
+	}
+
+	// Handle different Beacon API endpoints (only reached when ready)
 	switch {
 	case r.URL.Path == "/eth/v1/events":
 		// Handle events stream - this is what geth needs for consensus updates

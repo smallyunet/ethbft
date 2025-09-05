@@ -43,6 +43,12 @@ type Server struct {
 	// Event stream clients
 	eventClients    map[chan []byte]bool
 	eventClientsMux sync.RWMutex
+
+	// Readiness gating
+	readyMu      sync.RWMutex
+	gethReady    bool // at least one successful call to GetLatestExecutionStateRoot
+	cometReady   bool // at least one successful call to GetLatestBlock
+	presetLoaded bool // preset constants loaded
 }
 
 // NewServer creates a new Engine API server
@@ -74,6 +80,7 @@ func NewServer(cfg *config.Config, abciClient ABCIClient) (*Server, error) {
 		payloadsBySlot:  make(map[int64]*ExecutionPayload),
 		blockSSZByRoot:  make(map[string][]byte),
 		blockJSONByRoot: make(map[string][]byte),
+		presetLoaded:    true, // constants in constants.go are compile-time, mark as loaded
 	}
 
 	// Start block monitoring
@@ -113,6 +120,19 @@ func (s *Server) storeSlotToRoot(slot int64, root string) {
 	s.rootSlots[root] = slot
 }
 
+// storeBlock atomically persists SSZ bytes and mappings (slot->root, root->slot, updates head)
+func (s *Server) storeBlock(slot int64, root string, sszBytes []byte, hdr beaconHeaderFields, payload *ExecutionPayload) {
+	s.blockMutex.Lock()
+	defer s.blockMutex.Unlock()
+	s.blockSSZByRoot[root] = sszBytes
+	s.slotRoots[slot] = root
+	s.rootSlots[root] = slot
+	s.headerData[root] = hdr // legacy cache
+	s.payloadsBySlot[slot] = payload
+	s.blockJSONByRoot[root] = buildBeaconBlockJSON(hdr, payload) // legacy JSON (may be removed later)
+	s.headRoot = root
+}
+
 // loadBytesByRoot loads SSZ bytes by beacon block root
 func (s *Server) loadBytesByRoot(root string) ([]byte, bool) {
 	s.blockMutex.RLock()
@@ -124,6 +144,9 @@ func (s *Server) loadBytesByRoot(root string) ([]byte, bool) {
 // Start starts the Engine API server
 func (s *Server) Start() error {
 	mux := http.NewServeMux()
+	// Health endpoints bypass JSON-RPC / Beacon API gating
+	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.HandleFunc("/readyz", s.handleReadyz)
 	mux.HandleFunc("/", s.handleRequest)
 
 	// Parse the engine API endpoint to get the port
@@ -237,163 +260,135 @@ func (s *Server) monitorBlocks() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	height, hash, err := s.abciClient.GetLatestBlock(context.Background())
-	if err != nil {
-		s.blockMutex.Lock()
-		s.latestBlockHeight = 0
-		s.latestBlockHash = zeroHash32()
-		s.headRoot = s.latestBlockHash
-		s.blockMutex.Unlock()
-	} else {
+	// Initial probe (do not create blocks until fully ready)
+	height, _, err := s.abciClient.GetLatestBlock(context.Background())
+	if err == nil {
+		s.readyMu.Lock()
+		s.cometReady = true
+		s.readyMu.Unlock()
 		s.blockMutex.Lock()
 		s.latestBlockHeight = height
-
-		// Try to get the execution state root from ABCI client first
-		var stateRoot string
-		if execStateRoot, err := s.abciClient.GetLatestExecutionStateRoot(context.Background()); err == nil {
-			stateRoot = normalizeRoot(execStateRoot)
-			log.Printf("Initial setup: using execution state root from Geth: %s", stateRoot)
-		} else {
-			// Fall back to using the latest payload's state root if available
-			if s.latestPayload != nil && s.latestPayload.StateRoot != "" {
-				stateRoot = normalizeRoot(s.latestPayload.StateRoot)
-				log.Printf("Initial setup: using execution state root from payload: %s", stateRoot)
-			} else {
-				stateRoot = normalizeRoot(hash)
-				log.Printf("Initial setup: using CometBFT hash as fallback: %s (warning: this may cause state root mismatch)", stateRoot)
-			}
-		}
-		s.latestBlockHash = stateRoot
-
-		parent := zeroHash32()
-		if s.headRoot != "" {
-			parent = s.headRoot
-		}
-		// Use CometBFT block hash as execution block hash (non-zero) for payload block_hash field
-		// Static mainnet genesis execution payload (slot-aligned synthetic) per user instruction
-		initialPayload := &ExecutionPayload{
-			ParentHash:            zeroHash32(),
-			FeeRecipient:          zeroHexBytes(20),
-			StateRoot:             "0xd7f8974fb5ac78d9ac099b9ad5018bedc2ce0a72dad1827a1709da30580f0544",
-			ReceiptsRoot:          "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
-			LogsBloom:             zeroBloom256(),
-			PrevRandao:            zeroHash32(),
-			BlockNumber:           "0x0",
-			GasLimit:              "0x1388",
-			GasUsed:               "0x0",
-			Timestamp:             "0x0",
-			ExtraData:             "0x11bbe8db4e347b4e8c937c1c8370e4b5ed33adb3db69cbdb7a38e1e50b1b82fa",
-			BaseFeePerGas:         "0x0",
-			BlockHash:             "0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3",
-			Transactions:          []string{},
-			Withdrawals:           []string{},
-			BlobGasUsed:           "0x0",
-			ExcessBlobGas:         "0x0",
-			ParentBeaconBlockRoot: zeroHash32(),
-		}
-		bodyRoot := computeBeaconBodyRootWithStateRoot(initialPayload)
-		blk := &SignedBeaconBlock{Message: &BeaconBlock{Slot: uint64(height), ProposerIndex: 0, ParentRoot: parent, StateRoot: s.latestBlockHash, Body: &BeaconBlockBody{ExecutionPayload: initialPayload}}}
-
-		// Store SSZ bytes and root mapping (only trust SSZ bytes, not objects)
-		sszBytes := marshalSignedBeaconBlockSSZ(blk)
-		root := computeSignedBeaconBlockRoot(blk)
-		s.storeRootToBytes(root, sszBytes)
-		s.storeSlotToRoot(height, root)
-
-		// Legacy storage for compatibility (will be removed)
-		hdr := beaconHeaderFields{Slot: height, ParentRoot: parent, StateRoot: s.latestBlockHash, BodyRoot: bodyRoot}
-		s.headRoot = root
-		s.headerData[root] = hdr
-		s.payloadsBySlot[height] = initialPayload
-		s.blockJSONByRoot[root] = buildBeaconBlockJSON(hdr, initialPayload)
-		// Verify creation consistency
-		verifyBody := computeBeaconBodyRootWithStateRoot(initialPayload)
-		if verifyBody != bodyRoot {
-			log.Printf("BODY_ROOT_INIT_MISMATCH slot=%d stored=%s recomputed=%s", height, bodyRoot, verifyBody)
-		}
 		s.blockMutex.Unlock()
 	}
 
 	for {
 		<-ticker.C
-		h, hsh, err := s.abciClient.GetLatestBlock(context.Background())
+		h, _, err := s.abciClient.GetLatestBlock(context.Background())
 		if err != nil {
 			log.Printf("GetLatestBlock: %v", err)
+			s.readyMu.Lock()
+			s.cometReady = false
+			s.readyMu.Unlock()
 			continue
 		}
+		s.readyMu.Lock()
+		s.cometReady = true
+		s.readyMu.Unlock()
 		s.blockMutex.Lock()
 		if h > s.latestBlockHeight {
 			prevHead := s.headRoot
 			s.latestBlockHeight = h
 
-			// Try to get the execution state root from ABCI client first
-			var stateRoot string
-			if execStateRoot, err := s.abciClient.GetLatestExecutionStateRoot(context.Background()); err == nil {
-				stateRoot = normalizeRoot(execStateRoot)
-				log.Printf("Using execution state root from Geth: %s", stateRoot)
-			} else {
-				// Fall back to using the latest payload's state root if available
-				if s.latestPayload != nil && s.latestPayload.StateRoot != "" {
-					stateRoot = normalizeRoot(s.latestPayload.StateRoot)
-					log.Printf("Using execution state root from payload: %s", stateRoot)
-				} else {
-					stateRoot = normalizeRoot(hsh)
-					log.Printf("Using CometBFT hash as fallback: %s (warning: this may cause state root mismatch)", stateRoot)
-				}
+			// Attempt to get execution state root; if fail, mark not ready & skip block production
+			execStateRoot, err := s.abciClient.GetLatestExecutionStateRoot(context.Background())
+			if err != nil {
+				log.Printf("GetLatestExecutionStateRoot failed (will not fallback): %v", err)
+				s.readyMu.Lock()
+				s.gethReady = false
+				s.readyMu.Unlock()
+				s.blockMutex.Unlock()
+				continue
 			}
+			stateRoot := normalizeRoot(execStateRoot)
+			s.readyMu.Lock()
+			s.gethReady = true
+			readyNow := s.gethReady && s.cometReady && s.presetLoaded
+			s.readyMu.Unlock()
 			s.latestBlockHash = stateRoot
 
 			parent := prevHead
 			if parent == "" {
 				parent = zeroHash32()
 			}
-			// Reuse existing deterministic payload if present (slot should not change contents after first creation)
+
+			if !readyNow {
+				// Not fully ready yet; do not produce/beacon block structures
+				s.blockMutex.Unlock()
+				continue
+			}
+
+			// Create a new ExecutionPayload for each slot with proper fields
 			var payloadForSlot *ExecutionPayload
 			if p, ok := s.payloadsBySlot[h]; ok {
 				payloadForSlot = p
 			} else {
-				// Reuse the static genesis execution payload for all subsequent slots (demo mode)
+				// Get previous payload hash for parent_hash
+				prevPayloadHash := zeroHash32()
+				if h > 0 {
+					if pPrev, ok := s.payloadsBySlot[h-1]; ok {
+						prevPayloadHash = pPrev.BlockHash
+					}
+				}
+
+				// Get timestamp from CometBFT (or use current time)
+				ts := uint64(time.Now().Unix())
+
 				payloadForSlot = &ExecutionPayload{
-					ParentHash:            zeroHash32(),
-					FeeRecipient:          zeroHexBytes(20),
-					StateRoot:             "0xd7f8974fb5ac78d9ac099b9ad5018bedc2ce0a72dad1827a1709da30580f0544",
-					ReceiptsRoot:          "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
-					LogsBloom:             zeroBloom256(),
+					ParentHash:            prevPayloadHash, // Previous payload's block_hash
+					FeeRecipient:          "0x0000000000000000000000000000000000000000",
+					StateRoot:             s.latestBlockHash,                                                    // Execution layer state root from ABCI
+					ReceiptsRoot:          "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421", // Empty receipts root
+					LogsBloom:             "0x" + strings.Repeat("0", 512),
 					PrevRandao:            zeroHash32(),
-					BlockNumber:           "0x0",
-					GasLimit:              "0x1388",
+					BlockNumber:           fmt.Sprintf("0x%x", h), // Use slot as block number for monotonic increase
+					GasLimit:              "0x1c9c380",            // 30,000,000 gas limit
 					GasUsed:               "0x0",
-					Timestamp:             "0x0",
-					ExtraData:             "0x11bbe8db4e347b4e8c937c1c8370e4b5ed33adb3db69cbdb7a38e1e50b1b82fa",
-					BaseFeePerGas:         "0x0",
-					BlockHash:             "0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3",
-					Transactions:          []string{},
-					Withdrawals:           []string{},
+					Timestamp:             fmt.Sprintf("0x%x", ts),
+					ExtraData:             "0x",
+					BaseFeePerGas:         "0x0",      // Demo value, can be 0
+					Transactions:          []string{}, // Empty transaction list
+					Withdrawals:           []string{}, // Empty withdrawals
 					BlobGasUsed:           "0x0",
 					ExcessBlobGas:         "0x0",
-					ParentBeaconBlockRoot: zeroHash32(),
+					ParentBeaconBlockRoot: s.headRoot, // Previous beacon header
 				}
+
+				// Compute and set the payload BlockHash
+				payloadForSlot.BlockHash = computeExecutionBlockHash(payloadForSlot)
+
+				// Store the payload
 				s.payloadsBySlot[h] = payloadForSlot
 			}
-			bodyRoot := computeBeaconBodyRootWithStateRoot(payloadForSlot)
-			blk := &SignedBeaconBlock{Message: &BeaconBlock{Slot: uint64(h), ProposerIndex: 0, ParentRoot: parent, StateRoot: s.latestBlockHash, Body: &BeaconBlockBody{ExecutionPayload: payloadForSlot}}}
 
-			// Store SSZ bytes and root mapping (only trust SSZ bytes, not objects)
-			sszBytes := marshalSignedBeaconBlockSSZ(blk)
-			newRoot := computeSignedBeaconBlockRoot(blk)
-			s.storeRootToBytes(newRoot, sszBytes)
-			s.storeSlotToRoot(h, newRoot)
+			// Create complete BeaconBlockBody with ExecutionPayload and default values for other fields
+			body := &BeaconBlockBody{
+				ExecutionPayload: payloadForSlot,
+				// All other fields are zero/empty by default which is correct for our demo
+			}
+			bodyRoot := computeBeaconBodyRootDeneb(body)
+			blk := &SignedBeaconBlock{
+				Message: &BeaconBlock{
+					Slot:          uint64(h),
+					ProposerIndex: 0,
+					ParentRoot:    parent,
+					StateRoot:     s.latestBlockHash,
+					Body:          body,
+				},
+			}
+			// Use canonical serialization wrapper (currently fallback to legacy bytes) for future real SSZ integration.
+			newRoot, sszBytes, serr := serializeCanonicalSSZ(blk)
+			if serr != nil {
+				log.Printf("serializeCanonicalSSZ error: %v", serr)
+				s.blockMutex.Unlock()
+				continue
+			}
+			hdr := beaconHeaderFields{Slot: h, ParentRoot: parent, StateRoot: s.latestBlockHash, BodyRoot: bodyRoot}
+			s.storeBlock(h, newRoot, sszBytes, hdr, payloadForSlot)
 
 			// Verify recomputation stability
-			if recompute := computeBeaconBodyRootWithStateRoot(payloadForSlot); recompute != bodyRoot {
+			if recompute := computeBeaconBodyRootDeneb(body); recompute != bodyRoot {
 				log.Printf("BODY_ROOT_DRIFT slot=%d bodyRoot=%s recompute=%s", h, bodyRoot, recompute)
 			}
-
-			// Legacy storage for compatibility (will be removed)
-			hdr := beaconHeaderFields{Slot: h, ParentRoot: parent, StateRoot: s.latestBlockHash, BodyRoot: bodyRoot}
-			s.headRoot = newRoot
-			s.headerData[newRoot] = hdr
-			s.blockJSONByRoot[newRoot] = buildBeaconBlockJSON(hdr, payloadForSlot)
 
 			if true { // verbose chunk debug (spec header chunks expected=4 for Deneb)
 				chunks := computeBeaconHeaderLeaves(hdr)
@@ -419,6 +414,28 @@ func (s *Server) monitorBlocks() {
 			s.blockMutex.Unlock()
 		}
 	}
+}
+
+// Readiness helpers
+func (s *Server) isReady() bool {
+	s.readyMu.RLock()
+	defer s.readyMu.RUnlock()
+	return s.gethReady && s.cometReady && s.presetLoaded
+}
+
+func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
+}
+
+func (s *Server) handleReadyz(w http.ResponseWriter, _ *http.Request) {
+	if s.isReady() {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready"))
+		return
+	}
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_, _ = w.Write([]byte("not ready"))
 }
 
 // verifyJWT verifies the JWT token in the request
