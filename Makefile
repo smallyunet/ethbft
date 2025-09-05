@@ -59,7 +59,7 @@ docker-down:
 	@echo "Docker environment stopped"
 
 # Rebuild Docker containers
-docker-rebuild: docker-down
+docker-rebuild: docker-down generate-jwt create-genesis
 	@echo "Rebuilding Docker containers..."
 	docker-compose build
 	@echo "Rebuild complete, starting containers..."
