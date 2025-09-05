@@ -11,7 +11,5 @@ bridge:
   listenAddr: "0.0.0.0:8080"
   logLevel: "info"
   retryInterval: 5
-  # Disable mock Engine API server - EthBFT should only be a client
-  enableEngineServer: false
   # Enable actual bridging from CometBFT to Geth
   enableBridging: true

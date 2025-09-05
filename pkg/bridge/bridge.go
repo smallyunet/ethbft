@@ -11,23 +11,21 @@ import (
 
 	"github.com/smallyunet/ethbft/pkg/config"
 	"github.com/smallyunet/ethbft/pkg/consensus"
-	"github.com/smallyunet/ethbft/pkg/engine"
 	"github.com/smallyunet/ethbft/pkg/ethereum"
 )
 
 // Bridge is the main component that connects Ethereum execution clients with CometBFT consensus
 type Bridge struct {
-	config       *config.Config
-	ethClient    *ethereum.Client
-	consClient   *consensus.Client
-	abciServer   *ABCIServer
-	engineServer *engine.Server
-	abciApp      *ABCIApplication
-	ctx          context.Context
-	cancel       context.CancelFunc
-	wg           sync.WaitGroup
-	running      bool
-	runningLock  sync.Mutex
+	config      *config.Config
+	ethClient   *ethereum.Client
+	consClient  *consensus.Client
+	abciServer  *ABCIServer
+	abciApp     *ABCIApplication
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	running     bool
+	runningLock sync.Mutex
 }
 
 // NewBridge creates a new bridge instance with enhanced architecture
@@ -58,16 +56,7 @@ func NewBridge(cfg *config.Config) (*Bridge, error) {
 	// Create the ABCI server with enhanced app
 	bridge.abciServer = NewABCIServer(bridge)
 
-	// Create Engine API server only if enabled (for testing/debugging)
-	if cfg.Bridge.EnableEngineServer {
-		bridge.engineServer, err = engine.NewServer(cfg, bridge.abciApp)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create Engine API server: %w", err)
-		}
-		log.Println("Engine API server enabled - this should only be used for testing!")
-	} else {
-		log.Println("Engine API server disabled - EthBFT will only act as a client to Geth")
-	}
+	log.Println("EthBFT will only act as a client to Geth")
 
 	return bridge, nil
 }
@@ -83,19 +72,8 @@ func (b *Bridge) Start() error {
 
 	log.Println("Starting EthBFT bridge with enhanced architecture")
 
-	// Start the Engine API server only if enabled
-	if b.engineServer != nil {
-		if err := b.engineServer.Start(); err != nil {
-			return fmt.Errorf("failed to start Engine API server: %w", err)
-		}
-		log.Println("Engine API server started (testing mode)")
-	}
-
 	// Start the ABCI server
 	if err := b.abciServer.Start(); err != nil {
-		if b.engineServer != nil {
-			b.engineServer.Stop()
-		}
 		return fmt.Errorf("failed to start ABCI server: %w", err)
 	}
 
@@ -127,11 +105,6 @@ func (b *Bridge) Stop() error {
 	}
 
 	log.Println("Stopping EthBFT bridge")
-
-	// Stop the Engine API server
-	if b.engineServer != nil {
-		b.engineServer.Stop()
-	}
 
 	// Stop the ABCI server
 	if b.abciServer != nil {
@@ -321,7 +294,7 @@ func (b *Bridge) processBlock(height int64) error {
 }
 
 // convertBlockToPayload converts a CometBFT block to an Ethereum execution payload
-func (b *Bridge) convertBlockToPayload(height int64) (*engine.ExecutionPayload, error) {
+func (b *Bridge) convertBlockToPayload(height int64) (*ExecutionPayload, error) {
 	// This is a simplified conversion - you'll need to implement proper conversion logic
 	// based on your specific requirements
 
@@ -336,7 +309,7 @@ func (b *Bridge) convertBlockToPayload(height int64) (*engine.ExecutionPayload, 
 	}
 
 	// For now, create a basic payload with empty transactions
-	payload := &engine.ExecutionPayload{
+	payload := &ExecutionPayload{
 		ParentHash:    parentHash,
 		FeeRecipient:  "0x0000000000000000000000000000000000000000",
 		StateRoot:     "0x0000000000000000000000000000000000000000000000000000000000000000",
@@ -353,8 +326,8 @@ func (b *Bridge) convertBlockToPayload(height int64) (*engine.ExecutionPayload, 
 		Transactions:  []string{}, // Empty for now
 		// Deneb fields (can be empty for now)
 		Withdrawals:           []string{},
-		BlobGasUsed:          "0x0",
-		ExcessBlobGas:        "0x0",
+		BlobGasUsed:           "0x0",
+		ExcessBlobGas:         "0x0",
 		ParentBeaconBlockRoot: "0x0000000000000000000000000000000000000000000000000000000000000000",
 	}
 
@@ -362,7 +335,7 @@ func (b *Bridge) convertBlockToPayload(height int64) (*engine.ExecutionPayload, 
 }
 
 // sendNewPayload sends a newPayload call to Geth's Engine API
-func (b *Bridge) sendNewPayload(payload *engine.ExecutionPayload) error {
+func (b *Bridge) sendNewPayload(payload *ExecutionPayload) error {
 	log.Printf("Sending engine_newPayloadV3 for block %s", payload.BlockNumber)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -383,16 +356,16 @@ func (b *Bridge) sendNewPayload(payload *engine.ExecutionPayload) error {
 		LatestValidHash string `json:"latestValidHash,omitempty"`
 		ValidationError string `json:"validationError,omitempty"`
 	}
-	
+
 	if err := json.Unmarshal(result, &response); err != nil {
 		return fmt.Errorf("failed to parse newPayload response: %w", err)
 	}
 
-	log.Printf("engine_newPayloadV3 response: status=%s, latestValidHash=%s", 
+	log.Printf("engine_newPayloadV3 response: status=%s, latestValidHash=%s",
 		response.Status, response.LatestValidHash)
 
 	if response.Status != "VALID" && response.Status != "ACCEPTED" {
-		return fmt.Errorf("payload rejected with status: %s, error: %s", 
+		return fmt.Errorf("payload rejected with status: %s, error: %s",
 			response.Status, response.ValidationError)
 	}
 
@@ -436,11 +409,11 @@ func (b *Bridge) sendForkchoiceUpdate(blockHash string) error {
 		return fmt.Errorf("failed to parse forkchoiceUpdated response: %w", err)
 	}
 
-	log.Printf("engine_forkchoiceUpdatedV2 response: status=%s, latestValidHash=%s", 
+	log.Printf("engine_forkchoiceUpdatedV2 response: status=%s, latestValidHash=%s",
 		response.PayloadStatus.Status, response.PayloadStatus.LatestValidHash)
 
 	if response.PayloadStatus.Status != "VALID" {
-		return fmt.Errorf("forkchoice update rejected with status: %s, error: %s", 
+		return fmt.Errorf("forkchoice update rejected with status: %s, error: %s",
 			response.PayloadStatus.Status, response.PayloadStatus.ValidationError)
 	}
 

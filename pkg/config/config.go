@@ -25,11 +25,10 @@ type Config struct {
 
 	// Bridge configuration
 	Bridge struct {
-		ListenAddr         string `yaml:"listenAddr"`         // Address to listen on (e.g., "0.0.0.0:8080")
-		LogLevel           string `yaml:"logLevel"`           // Log level (debug, info, warn, error)
-		RetryInterval      int    `yaml:"retryInterval"`      // Seconds between connection retry attempts
-		EnableEngineServer bool   `yaml:"enableEngineServer"` // Whether to start the mock Engine API server
-		EnableBridging     bool   `yaml:"enableBridging"`     // Whether to enable actual CometBFT->Geth bridging
+		ListenAddr     string `yaml:"listenAddr"`     // Address to listen on (e.g., "0.0.0.0:8080")
+		LogLevel       string `yaml:"logLevel"`       // Log level (debug, info, warn, error)
+		RetryInterval  int    `yaml:"retryInterval"`  // Seconds between connection retry attempts
+		EnableBridging bool   `yaml:"enableBridging"` // Whether to enable actual CometBFT->Geth bridging
 	} `yaml:"bridge"`
 }
 
@@ -50,8 +49,7 @@ func DefaultConfig() *Config {
 	cfg.Bridge.ListenAddr = "0.0.0.0:8080"
 	cfg.Bridge.LogLevel = "info"
 	cfg.Bridge.RetryInterval = 5
-	cfg.Bridge.EnableEngineServer = false // Default to disabled - only enable for testing
-	cfg.Bridge.EnableBridging = true      // Default to enabled for actual bridging
+	cfg.Bridge.EnableBridging = true // Default to enabled for actual bridging
 
 	return cfg
 }

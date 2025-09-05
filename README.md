@@ -5,7 +5,7 @@ EthBFT is a lightweight bridge that connects Ethereum execution clients (like Ge
 ## 🚀 Features
 
 - **ABCI Application**: Full CometBFT ABCI interface implementation
-- **Engine API Server**: Ethereum Engine API compatibility layer
+- **Engine API Client**: Connects to Ethereum Engine API as a client
 - **Health Monitoring**: Built-in connection monitoring and health checks
 - **Docker Support**: Complete containerized deployment
 - **JWT Authentication**: Secure Engine API communication
@@ -23,7 +23,6 @@ ethbft/
 │   │   └── server.go       # ABCI server implementation
 │   ├── config/            # Configuration management
 │   ├── consensus/          # CometBFT client integration
-│   ├── engine/             # Ethereum Engine API server
 │   └── ethereum/           # Ethereum client integration
 ├── config/                 # Configuration files
 ├── scripts/                # Utility scripts
@@ -126,7 +125,7 @@ EthBFT acts as a bridge layer between Ethereum execution clients and CometBFT co
 ### Components
 
 1. **ABCI Application**: Implements CometBFT's ABCI interface
-2. **Engine API Server**: Provides Ethereum Engine API compatibility
+2. **Engine API Client**: Connects to Geth's Engine API as a client
 3. **Bridge Logic**: Manages connections and data flow
 4. **Health Monitoring**: Monitors service connectivity
 
@@ -142,7 +141,7 @@ The Docker setup includes:
 
 - `8545`: Geth HTTP RPC
 - `8546`: Geth WebSocket RPC
-- `8551`: Engine API server
+- `8551`: Geth Engine API
 - `8080`: ABCI socket server
 - `8081`: Health check endpoint
 - `26656`: CometBFT P2P
