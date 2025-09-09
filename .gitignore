@@ -15,6 +15,9 @@
 # Dependency directories
 vendor/
 
+# Go module cache
+.gocache/
+
 # Generated JWT secret
 jwt.hex
 
