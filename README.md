@@ -129,7 +129,7 @@ ethereum:
   jwtSecret: "./jwt.hex"                 # Hex file (>= 32 bytes) used for HS256 JWT
 
 cometbft:
-  endpoint: "tcp://localhost:26657"      # Note: code expects an HTTP-postable endpoint; docker uses http://cometbft:26657
+  endpoint: "http://localhost:26657"     # HTTP endpoint exposed by CometBFT RPC
   homeDir: "./cometbft_home"
 
 bridge:
@@ -298,7 +298,7 @@ CGO_ENABLED=0 GOOS=linux go build -o ethbft ./cmd/ethbft
   - Usually due to invalid parent hash (EL not ready). Wait until Geth has at least one head block, then EthBFT will retry at next poll.
 
 6. **CometBFT Endpoint Scheme**
-  - Local default uses `tcp://`; Docker config uses `http://` (required for JSON-RPC POST). Ensure config matches actual running node.
+  - EthBFT expects an HTTP-accessible RPC endpoint (e.g., `http://localhost:26657`). Update `config.yaml` if CometBFT is bound elsewhere.
 
 ## 🔐 Security Notes
 

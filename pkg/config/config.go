@@ -19,7 +19,7 @@ type Config struct {
 
 	// CometBFT configuration
 	CometBFT struct {
-		Endpoint string `yaml:"endpoint"` // Endpoint for CometBFT node (e.g., "tcp://localhost:26657")
+		Endpoint string `yaml:"endpoint"` // Endpoint for CometBFT node (e.g., "http://localhost:26657")
 		HomeDir  string `yaml:"homeDir"`  // Home directory for CometBFT config and data
 	} `yaml:"cometbft"`
 
@@ -39,10 +39,10 @@ func DefaultConfig() *Config {
 	// Default Ethereum settings
 	cfg.Ethereum.Endpoint = "http://localhost:8545"
 	cfg.Ethereum.EngineAPI = "http://localhost:8551"
-	cfg.Ethereum.JWTSecret = "jwtsecret"
+	cfg.Ethereum.JWTSecret = "./jwt.hex"
 
 	// Default CometBFT settings
-	cfg.CometBFT.Endpoint = "tcp://localhost:26657"
+	cfg.CometBFT.Endpoint = "http://localhost:26657"
 	cfg.CometBFT.HomeDir = "./cometbft_home"
 
 	// Default Bridge settings

@@ -4,7 +4,7 @@ ethereum:
   jwtSecret: "./jwt.hex"
 
 cometbft:
-  endpoint: "tcp://localhost:26657"
+  endpoint: "http://localhost:26657"
   homeDir: "./cometbft_home"
 
 bridge:

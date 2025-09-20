@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/smallyunet/ethbft/pkg/config"
@@ -20,11 +22,39 @@ type Client struct {
 
 // NewClient creates a new CometBFT client
 func NewClient(cfg *config.Config) (*Client, error) {
+	endpoint, err := normalizeEndpoint(cfg.CometBFT.Endpoint)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Client{
 		config:     cfg,
 		httpClient: &http.Client{Timeout: 10 * time.Second},
-		endpoint:   cfg.CometBFT.Endpoint,
+		endpoint:   endpoint,
 	}, nil
+}
+
+func normalizeEndpoint(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", fmt.Errorf("cometbft endpoint cannot be empty")
+	}
+	if !strings.Contains(trimmed, "://") {
+		trimmed = "http://" + trimmed
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return "", fmt.Errorf("invalid cometbft endpoint %q: %w", raw, err)
+	}
+	switch u.Scheme {
+	case "http", "https":
+		return u.String(), nil
+	case "tcp":
+		u.Scheme = "http"
+		return u.String(), nil
+	default:
+		return "", fmt.Errorf("unsupported cometbft endpoint scheme %q", u.Scheme)
+	}
 }
 
 // RPCRequest represents an RPC request to CometBFT
