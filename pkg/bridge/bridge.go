@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,8 +36,39 @@ type Bridge struct {
 	running     bool
 	runningLock sync.Mutex
 
-	heightToHash map[int64]common.Hash // tracks head hashes by CometBFT height
-	elGenesis    common.Hash           // cached EL genesis (or zero if not found)
+	// heightToHash tracks EL head hashes by CometBFT height.
+	// Guarded by heightMu to be safe if accessed from multiple goroutines.
+	heightToHash map[int64]common.Hash
+	heightOrder  []int64      // insertion order for pruning
+	heightMu     sync.RWMutex // protects heightToHash and heightOrder
+	maxHistory   int          // maximum entries retained in heightToHash
+
+	elGenesis common.Hash // cached EL genesis (or zero if not found)
+}
+
+// getHeightHash returns the stored EL head hash for a given CometBFT height.
+// It is safe for concurrent use.
+func (b *Bridge) getHeightHash(h int64) common.Hash {
+	b.heightMu.RLock()
+	defer b.heightMu.RUnlock()
+	return b.heightToHash[h]
+}
+
+// setHeightHash stores the hash for the given height and prunes old entries
+// to limit memory usage. It is safe for concurrent use.
+func (b *Bridge) setHeightHash(h int64, hash common.Hash) {
+	b.heightMu.Lock()
+	defer b.heightMu.Unlock()
+	if _, exists := b.heightToHash[h]; !exists {
+		b.heightOrder = append(b.heightOrder, h)
+	}
+	b.heightToHash[h] = hash
+	// prune if exceeding maxHistory
+	for b.maxHistory > 0 && len(b.heightOrder) > b.maxHistory {
+		oldH := b.heightOrder[0]
+		b.heightOrder = b.heightOrder[1:]
+		delete(b.heightToHash, oldH)
+	}
 }
 
 // NewBridge builds all clients and servers, reads EL genesis hash for initial forkchoice.
@@ -58,6 +90,8 @@ func NewBridge(cfg *config.Config) (*Bridge, error) {
 		ctx:          ctx,
 		cancel:       cancel,
 		heightToHash: make(map[int64]common.Hash),
+		heightOrder:  make([]int64, 0, 1024),
+		maxHistory:   4096,
 	}
 
 	b.abciApp = NewABCIApplication(b)
@@ -149,11 +183,20 @@ func (b *Bridge) runBlockBridging() {
 				log.Printf("[bridge] get status error: %v", err)
 				continue
 			}
-			// Extract latest_block_height from CometBFT status.
+			// Extract latest_block_height from CometBFT status robustly.
 			var currentHeight int64
 			if syncInfo, ok := status["sync_info"].(map[string]interface{}); ok {
 				if hstr, ok2 := syncInfo["latest_block_height"].(string); ok2 {
-					fmt.Sscanf(hstr, "%d", &currentHeight)
+					// Prefer strconv for strict parsing; support both decimal and 0x-prefixed hex just in case.
+					if strings.HasPrefix(hstr, "0x") || strings.HasPrefix(hstr, "0X") {
+						if v, err := strconv.ParseInt(strings.TrimPrefix(strings.ToLower(hstr), "0x"), 16, 64); err == nil {
+							currentHeight = v
+						}
+					} else {
+						if v, err := strconv.ParseInt(hstr, 10, 64); err == nil {
+							currentHeight = v
+						}
+					}
 				}
 			}
 			if currentHeight <= lastHeight {
@@ -232,7 +275,7 @@ func (b *Bridge) getBlockTimestampByHash(ctx context.Context, h common.Hash) uin
 // 4) engine_forkchoiceUpdatedV2(state=head=headOfPayload, safe=head, finalized=head)
 func (b *Bridge) produceBlockAtHeight(height int64) error {
 	// 1) Choose parent: prefer last height's head; otherwise EL head; otherwise genesis.
-	parent := b.heightToHash[height-1]
+	parent := b.getHeightHash(height - 1)
 
 	// Determine a sane parent and parent timestamp.
 	var parentTs uint64
@@ -359,7 +402,7 @@ func (b *Bridge) produceBlockAtHeight(height int64) error {
 	}
 
 	// Track mapping: height -> head hash (used to pick parent next time).
-	b.heightToHash[height] = head
+	b.setHeightHash(height, head)
 	log.Printf("[bridge] produced by EL: height=%d head=%s", height, head.Hex())
 	return nil
 }
@@ -475,13 +518,13 @@ func (b *Bridge) buildPlaceholderPayload(height int64) (*ExecutionPayload, error
 func (b *Bridge) updateForkchoice(headHeight int64, headHash common.Hash) error {
 	safeHash := headHash
 	if h := headHeight - 2; h > 0 {
-		if hh, ok := b.heightToHash[h]; ok {
+		if hh := b.getHeightHash(h); hh != (common.Hash{}) {
 			safeHash = hh
 		}
 	}
 	finalizedHash := safeHash
 	if h := headHeight - 5; h > 0 {
-		if hh, ok := b.heightToHash[h]; ok {
+		if hh := b.getHeightHash(h); hh != (common.Hash{}) {
 			finalizedHash = hh
 		}
 	}

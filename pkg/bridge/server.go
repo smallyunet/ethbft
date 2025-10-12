@@ -133,6 +133,15 @@ func (app *ABCIApplication) GetPendingPayload(ctx context.Context) (*ExecutionPa
 		ReceiptsRoot: common.HexToHash(getStringField(block, "receiptsRoot")),
 		LogsBloom: func() []byte {
 			b, _ := hex.DecodeString(strings.TrimPrefix(getStringField(block, "logsBloom"), "0x"))
+			// Ensure logs bloom is exactly 256 bytes (2048 bits) as expected by EL types.
+			if len(b) < 256 {
+				pad := make([]byte, 256)
+				copy(pad[256-len(b):], b)
+				return pad
+			}
+			if len(b) > 256 {
+				return b[len(b)-256:]
+			}
 			return b
 		}(),
 		Random:    common.HexToHash(getStringField(block, "mixHash")),
