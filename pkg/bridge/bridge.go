@@ -173,15 +173,75 @@ func (b *Bridge) Healthy() bool { return b.running }
 // runBlockBridging polls CometBFT latest height and for each new height triggers the Engine API loop.
 func (b *Bridge) runBlockBridging() {
 	defer b.wg.Done()
-	b.logger.Info("Block bridging loop started")
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
+	b.logger.Info("Block bridging loop started (Event-Driven)")
+
+	// Subscribe to new blocks
+	heightCh, err := b.consClient.SubscribeNewBlocks(b.ctx)
+	if err != nil {
+		b.logger.Error("Failed to subscribe to new blocks, falling back to polling", "error", err)
+		b.runPollingLoop()
+		return
+	}
+	defer b.consClient.UnsubscribeAll(context.Background())
 
 	var lastHeight int64 = 0
+
+	// Initial fetch to set lastHeight
+	if h, err := b.fetchCometHeight(); err == nil {
+		lastHeight = h
+	}
+
 	for {
 		select {
 		case <-b.ctx.Done():
 			b.logger.Info("Block bridging loop stopped")
+			return
+		case h, ok := <-heightCh:
+			if !ok {
+				b.logger.Warn("Subscription channel closed, falling back to polling")
+				b.runPollingLoop()
+				return
+			}
+			if h <= lastHeight {
+				continue
+			}
+			// Process missing heights sequentially (if any gap)
+			for i := lastHeight + 1; i <= h; i++ {
+				if err := b.processHeight(i); err != nil {
+					b.logger.Error("Failed to process height", "height", i, "error", err)
+					// If we fail, we might want to retry?
+					// For now, log and continue to keep up with the stream,
+					// or maybe we should break and retry?
+					// In event stream, if we fail, we might miss it.
+					// Let's retry a few times then move on?
+					// Or just break and let the next event trigger the gap fill again?
+					// If we break here, lastHeight is not updated.
+					// Next event h+1 comes, we loop from lastHeight+1 again.
+					// So breaking is safe and correct for retrying.
+					break
+				} else {
+					lastHeight = i
+					b.txPool.Prune(i - 100)
+				}
+			}
+		}
+	}
+}
+
+func (b *Bridge) runPollingLoop() {
+	b.logger.Info("Starting polling loop fallback")
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	var lastHeight int64 = 0
+	// Try to get current height
+	if h, err := b.fetchCometHeight(); err == nil {
+		lastHeight = h
+	}
+
+	for {
+		select {
+		case <-b.ctx.Done():
 			return
 		case <-ticker.C:
 			currentHeight, err := b.fetchCometHeight()
@@ -194,17 +254,12 @@ func (b *Bridge) runBlockBridging() {
 				continue
 			}
 
-			// Process missing heights sequentially.
 			for h := lastHeight + 1; h <= currentHeight; h++ {
 				if err := b.processHeight(h); err != nil {
 					b.logger.Error("Failed to process height", "height", h, "error", err)
-					// If we fail to process a height, we stop and retry this height on next tick
-					// effectively blocking progress until this height succeeds.
-					// This is safer than skipping holes.
 					break
 				} else {
 					lastHeight = h
-					// Prune old txs
 					b.txPool.Prune(h - 100)
 				}
 			}

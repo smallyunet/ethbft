@@ -1,23 +1,26 @@
 package consensus
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
+	"log/slog"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
+	rpchttp "github.com/cometbft/cometbft/rpc/client/http"
+	"github.com/cometbft/cometbft/types"
 	"github.com/smallyunet/ethbft/pkg/config"
 )
 
 // Client represents a CometBFT consensus client
 type Client struct {
-	config     *config.Config
-	httpClient *http.Client
-	endpoint   string
+	config    *config.Config
+	rpcClient *rpchttp.HTTP
+	endpoint  string
+	logger    *slog.Logger
 }
 
 // NewClient creates a new CometBFT client
@@ -27,10 +30,17 @@ func NewClient(cfg *config.Config) (*Client, error) {
 		return nil, err
 	}
 
+	// Create the CometBFT HTTP/WS client
+	rpcClient, err := rpchttp.New(endpoint, "/websocket")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create cometbft client: %w", err)
+	}
+
 	return &Client{
-		config:     cfg,
-		httpClient: &http.Client{Timeout: 10 * time.Second},
-		endpoint:   endpoint,
+		config:    cfg,
+		rpcClient: rpcClient,
+		endpoint:  endpoint,
+		logger:    slog.Default().With("component", "consensus_client"),
 	}, nil
 }
 
@@ -39,6 +49,7 @@ func normalizeEndpoint(raw string) (string, error) {
 	if trimmed == "" {
 		return "", fmt.Errorf("cometbft endpoint cannot be empty")
 	}
+	// rpchttp.New expects full URL
 	if !strings.Contains(trimmed, "://") {
 		trimmed = "http://" + trimmed
 	}
@@ -47,109 +58,139 @@ func normalizeEndpoint(raw string) (string, error) {
 		return "", fmt.Errorf("invalid cometbft endpoint %q: %w", raw, err)
 	}
 	switch u.Scheme {
-	case "http", "https":
-		return u.String(), nil
-	case "tcp":
-		u.Scheme = "http"
+	case "http", "https", "tcp":
 		return u.String(), nil
 	default:
 		return "", fmt.Errorf("unsupported cometbft endpoint scheme %q", u.Scheme)
 	}
 }
 
-// RPCRequest represents an RPC request to CometBFT
-type RPCRequest struct {
-	JSONRPC string      `json:"jsonrpc"`
-	ID      string      `json:"id"`
-	Method  string      `json:"method"`
-	Params  interface{} `json:"params"`
-}
+// Call makes an RPC call to CometBFT (legacy wrapper, prefer using rpcClient methods directly if possible)
+// Kept for backward compatibility with existing bridge logic if needed, but we should migrate.
+// For now, we implement a basic wrapper or just use the rpcClient.
+func (c *Client) Call(ctx context.Context, method string, params map[string]interface{}) (json.RawMessage, error) {
+	// This is a bit hacky because rpchttp.HTTP doesn't expose a generic Call easily without internal types.
+	// But for our specific needs (block, status), we can use the typed methods.
+	// If generic call is strictly needed, we might need to keep the old HTTP client or use reflection.
+	// For "block" and "status", let's use the typed methods.
 
-// RPCResponse represents an RPC response from CometBFT
-type RPCResponse struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      string          `json:"id"`
-	Result  json.RawMessage `json:"result,omitempty"`
-	Error   *RPCError       `json:"error,omitempty"`
-}
+	switch method {
+	case "status":
+		status, err := c.rpcClient.Status(ctx)
+		if err != nil {
+			return nil, err
+		}
+		// Marshal back to JSON to match old interface expectation
+		return json.Marshal(map[string]interface{}{
+			"sync_info": map[string]interface{}{
+				"latest_block_height": strconv.FormatInt(status.SyncInfo.LatestBlockHeight, 10),
+				"latest_block_hash":   status.SyncInfo.LatestBlockHash.String(),
+			},
+		})
+	case "block":
+		heightStr, ok := params["height"].(string)
+		var height *int64
+		if ok {
+			h, _ := strconv.ParseInt(heightStr, 10, 64)
+			height = &h
+		}
+		block, err := c.rpcClient.Block(ctx, height)
+		if err != nil {
+			return nil, err
+		}
+		// Map to structure expected by bridge (simplified)
+		// This is getting complex to map 1:1.
+		// Better approach: Update Bridge to use typed responses if possible, or do best effort mapping here.
+		// For now, let's do best effort mapping to keep bridge.go happy without major refactor there yet.
+		res := map[string]interface{}{
+			"result": map[string]interface{}{
+				"block_id": map[string]interface{}{
+					"hash": block.BlockID.Hash.String(),
+				},
+				"block": map[string]interface{}{
+					"header": map[string]interface{}{
+						"height": strconv.FormatInt(block.Block.Height, 10),
+						"time":   block.Block.Time.Format(time.RFC3339),
+						"last_block_id": map[string]interface{}{
+							"hash": block.Block.LastBlockID.Hash.String(),
+						},
+					},
+					"data": map[string]interface{}{
+						"txs": block.Block.Data.Txs, // This is [][]byte, might need base64 encoding if caller expects string
+					},
+				},
+			},
+		}
+		// Txs need to be base64 strings for the old bridge logic?
+		// bridge.go: bts, err := base64.StdEncoding.DecodeString(tx)
+		// Yes, bridge expects base64 strings.
+		txs := make([]string, len(block.Block.Data.Txs))
+		for i, tx := range block.Block.Data.Txs {
+			txs[i] = string(tx) // Actually wait, if it's []byte, json.Marshal handles base64 for []byte automatically?
+			// No, standard json marshals []byte as base64 string.
+			// So we can just leave it as [][]byte in the map, and when we marshal the whole map, it becomes base64 strings.
+		}
+		res["result"].(map[string]interface{})["block"].(map[string]interface{})["data"] = map[string]interface{}{"txs": block.Block.Data.Txs}
 
-// RPCError represents an RPC error
-type RPCError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-	Data    string `json:"data,omitempty"`
-}
-
-// Call makes an RPC call to CometBFT
-func (c *Client) Call(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
-	request := RPCRequest{
-		JSONRPC: "2.0",
-		ID:      "1",
-		Method:  method,
-		Params:  params,
+		return json.Marshal(res)
 	}
 
-	requestBody, err := json.Marshal(request)
-	if err != nil {
-		return nil, fmt.Errorf("failed to serialize request: %w", err)
-	}
-
-	// Add debug log
-	fmt.Printf("CometBFT request [%s]: %s\n", method, string(requestBody))
-
-	req, err := http.NewRequestWithContext(ctx, "POST", c.endpoint, bytes.NewReader(requestBody))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create HTTP request [%s]: %w", c.endpoint, err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute HTTP request [%s]: %w", c.endpoint, err)
-	}
-	defer resp.Body.Close()
-
-	// Check HTTP status code
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP request returned non-success status code: %d", resp.StatusCode)
-	}
-
-	// Read the entire response body
-	var respBody bytes.Buffer
-	_, err = respBody.ReadFrom(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	// Add debug log
-	fmt.Printf("CometBFT response [%s]: %s\n", method, respBody.String())
-
-	// Decode JSON response
-	var rpcResp RPCResponse
-	if err := json.NewDecoder(bytes.NewReader(respBody.Bytes())).Decode(&rpcResp); err != nil {
-		return nil, fmt.Errorf("failed to decode JSON response: %w, raw response: %s", err, respBody.String())
-	}
-
-	if rpcResp.Error != nil {
-		return nil, fmt.Errorf("RPC error: code=%d, message=%s, data=%s",
-			rpcResp.Error.Code, rpcResp.Error.Message, rpcResp.Error.Data)
-	}
-
-	return rpcResp.Result, nil
+	return nil, fmt.Errorf("unsupported method %s", method)
 }
 
 // GetStatus gets the status of CometBFT node
 func (c *Client) GetStatus(ctx context.Context) (map[string]interface{}, error) {
-	result, err := c.Call(ctx, "status", nil)
+	status, err := c.rpcClient.Status(ctx)
 	if err != nil {
 		return nil, err
 	}
+	// Return map structure expected by bridge
+	return map[string]interface{}{
+		"sync_info": map[string]interface{}{
+			"latest_block_height": strconv.FormatInt(status.SyncInfo.LatestBlockHeight, 10),
+			"latest_block_hash":   status.SyncInfo.LatestBlockHash.String(),
+		},
+	}, nil
+}
 
-	var status map[string]interface{}
-	if err := json.Unmarshal(result, &status); err != nil {
-		return nil, err
+// SubscribeNewBlocks subscribes to NewBlock events and returns a channel of block heights.
+func (c *Client) SubscribeNewBlocks(ctx context.Context) (<-chan int64, error) {
+	if err := c.rpcClient.Start(); err != nil {
+		// It might be already started
+		if !strings.Contains(err.Error(), "already started") {
+			return nil, fmt.Errorf("failed to start rpc client: %w", err)
+		}
 	}
 
-	return status, nil
+	query := "tm.event = 'NewBlock'"
+	out, err := c.rpcClient.Subscribe(ctx, "ethbft-bridge", query, 100)
+	if err != nil {
+		return nil, fmt.Errorf("failed to subscribe to new blocks: %w", err)
+	}
+
+	heightCh := make(chan int64, 100)
+	go func() {
+		defer close(heightCh)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case e, ok := <-out:
+				if !ok {
+					return
+				}
+				data, ok := e.Data.(types.EventDataNewBlock)
+				if ok {
+					heightCh <- data.Block.Height
+				}
+			}
+		}
+	}()
+
+	return heightCh, nil
+}
+
+// UnsubscribeAll unsubscribes from all events.
+func (c *Client) UnsubscribeAll(ctx context.Context) error {
+	return c.rpcClient.UnsubscribeAll(ctx, "ethbft-bridge")
 }
