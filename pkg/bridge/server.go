@@ -5,7 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -25,13 +25,18 @@ type ABCIApplication struct {
 	bridge        *Bridge
 	lastPayload   *ExecutionPayload
 	lastPayloadMu sync.RWMutex
+	logger        *slog.Logger
 }
 
 func NewABCIApplication(bridge *Bridge) *ABCIApplication {
-	return &ABCIApplication{bridge: bridge}
+	return &ABCIApplication{
+		bridge: bridge,
+		logger: slog.Default().With("component", "abci_app"),
+	}
 }
 
 func (app *ABCIApplication) Info(ctx context.Context, req *abcitypes.RequestInfo) (*abcitypes.ResponseInfo, error) {
+	app.logger.Info("ABCI Info", "version", req.Version, "block_version", req.BlockVersion, "p2p_version", req.P2PVersion)
 	return &abcitypes.ResponseInfo{
 		Data:             "ethbft",
 		Version:          "1.0.0",
@@ -50,11 +55,12 @@ func (app *ABCIApplication) CheckTx(ctx context.Context, req *abcitypes.RequestC
 }
 
 func (app *ABCIApplication) InitChain(ctx context.Context, req *abcitypes.RequestInitChain) (*abcitypes.ResponseInitChain, error) {
+	app.logger.Info("ABCI InitChain", "chain_id", req.ChainId, "initial_height", req.InitialHeight)
 	return &abcitypes.ResponseInitChain{}, nil
 }
 
 func (app *ABCIApplication) PrepareProposal(ctx context.Context, req *abcitypes.RequestPrepareProposal) (*abcitypes.ResponsePrepareProposal, error) {
-	return &abcitypes.ResponsePrepareProposal{}, nil
+	return &abcitypes.ResponsePrepareProposal{Txs: req.Txs}, nil
 }
 
 func (app *ABCIApplication) ProcessProposal(ctx context.Context, req *abcitypes.RequestProcessProposal) (*abcitypes.ResponseProcessProposal, error) {
@@ -62,7 +68,12 @@ func (app *ABCIApplication) ProcessProposal(ctx context.Context, req *abcitypes.
 }
 
 func (app *ABCIApplication) FinalizeBlock(ctx context.Context, req *abcitypes.RequestFinalizeBlock) (*abcitypes.ResponseFinalizeBlock, error) {
-	// Echo OK for all txs; demo does not execute them.
+	// Capture transactions and store them in the pool for the bridge to pick up.
+	if len(req.Txs) > 0 {
+		app.logger.Info("ABCI FinalizeBlock received txs", "height", req.Height, "count", len(req.Txs))
+		app.bridge.txPool.AddTxs(req.Height, req.Txs)
+	}
+
 	txResults := make([]*abcitypes.ExecTxResult, len(req.Txs))
 	for i, tx := range req.Txs {
 		txResults[i] = &abcitypes.ExecTxResult{Code: abcitypes.CodeTypeOK, Data: tx}
@@ -161,8 +172,7 @@ func (app *ABCIApplication) GetPendingPayload(ctx context.Context) (*ExecutionPa
 		Transactions: [][]byte{},
 		Withdrawals:  nil,
 	}
-	log.Printf("[fallback] got execution payload from EL: number=%d stateRoot=%s hash=%s",
-		payload.Number, payload.StateRoot.Hex(), payload.BlockHash.Hex())
+	app.logger.Info("Fallback payload from EL", "number", payload.Number, "hash", payload.BlockHash.Hex())
 	return payload, nil
 }
 
@@ -189,7 +199,7 @@ func (app *ABCIApplication) UpdateForkchoice(ctx context.Context, state *Forkcho
 func (app *ABCIApplication) GetLatestBlock(ctx context.Context) (height int64, hash string, err error) {
 	status, err := app.bridge.consClient.GetStatus(ctx)
 	if err != nil {
-		log.Printf("Warning: failed to get CometBFT status: %v", err)
+		app.logger.Warn("Failed to get CometBFT status", "error", err)
 		return 0, "0x" + strings.Repeat("0", 64), nil
 	}
 	if syncInfo, ok := status["sync_info"].(map[string]interface{}); ok {
@@ -225,7 +235,7 @@ func (app *ABCIApplication) getGethStateRoot(ctx context.Context, height int64) 
 	if !ok {
 		return "", fmt.Errorf("state root not found in block")
 	}
-	log.Printf("Retrieved EL state root for height %d: %s", height, stateRoot)
+	// app.logger.Debug("Retrieved EL state root", "height", height, "stateRoot", stateRoot)
 	return stateRoot, nil
 }
 
@@ -239,6 +249,7 @@ type ABCIServer struct {
 	httpServer *http.Server
 	listenAddr string
 	healthAddr string
+	logger     *slog.Logger
 }
 
 func NewABCIServer(bridge *Bridge) *ABCIServer {
@@ -251,11 +262,12 @@ func NewABCIServer(bridge *Bridge) *ABCIServer {
 		bridge:     bridge,
 		listenAddr: addr,
 		healthAddr: health,
+		logger:     slog.Default().With("component", "abci_server"),
 	}
 }
 
 func (s *ABCIServer) Start() error {
-	log.Printf("Starting ABCI socket server on %s", s.listenAddr)
+	s.logger.Info("Starting ABCI socket server", "addr", s.listenAddr)
 	if s.bridge.abciApp == nil {
 		return fmt.Errorf("no ABCI application available")
 	}
@@ -279,12 +291,12 @@ func (s *ABCIServer) Start() error {
 	go func() {
 		ln, err := net.Listen("tcp", s.healthAddr)
 		if err != nil {
-			log.Printf("health server listen error: %v", err)
+			s.logger.Error("Health server listen error", "error", err)
 			return
 		}
-		log.Printf("Starting HTTP health check server on %s", s.healthAddr)
+		s.logger.Info("Starting HTTP health check server", "addr", s.healthAddr)
 		if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
-			log.Printf("health server error: %v", err)
+			s.logger.Error("Health server error", "error", err)
 		}
 	}()
 

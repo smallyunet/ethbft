@@ -5,7 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/big"
 	"strconv"
 	"strings"
@@ -28,6 +28,7 @@ type Bridge struct {
 	consClient *consensus.Client
 	abciServer *ABCIServer
 	abciApp    *ABCIApplication
+	txPool     *TxPool
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -44,6 +45,7 @@ type Bridge struct {
 	maxHistory   int          // maximum entries retained in heightToHash
 
 	elGenesis common.Hash // cached EL genesis (or zero if not found)
+	logger    *slog.Logger
 }
 
 // getHeightHash returns the stored EL head hash for a given CometBFT height.
@@ -73,6 +75,8 @@ func (b *Bridge) setHeightHash(h int64, hash common.Hash) {
 
 // NewBridge builds all clients and servers, reads EL genesis hash for initial forkchoice.
 func NewBridge(cfg *config.Config) (*Bridge, error) {
+	logger := slog.Default().With("component", "bridge")
+
 	ethClient, err := ethereum.NewClient(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create ethereum client: %w", err)
@@ -87,11 +91,13 @@ func NewBridge(cfg *config.Config) (*Bridge, error) {
 		config:       cfg,
 		ethClient:    ethClient,
 		consClient:   consClient,
+		txPool:       NewTxPool(),
 		ctx:          ctx,
 		cancel:       cancel,
 		heightToHash: make(map[int64]common.Hash),
 		heightOrder:  make([]int64, 0, 1024),
 		maxHistory:   4096,
+		logger:       logger,
 	}
 
 	b.abciApp = NewABCIApplication(b)
@@ -107,9 +113,11 @@ func NewBridge(cfg *config.Config) (*Bridge, error) {
 			if json.Unmarshal(res, &blk) == nil {
 				if h, _ := blk["hash"].(string); h != "" {
 					b.elGenesis = common.HexToHash(h)
-					log.Printf("[bridge] EL genesis hash: %s", b.elGenesis.Hex())
+					b.logger.Info("EL genesis hash found", "hash", b.elGenesis.Hex())
 				}
 			}
+		} else {
+			b.logger.Warn("Failed to fetch EL genesis hash", "error", err)
 		}
 	}
 
@@ -133,7 +141,7 @@ func (b *Bridge) Start() error {
 		go b.runBlockBridging()
 	}
 	b.running = true
-	log.Printf("Bridge started (bridging=%v)", b.config != nil && b.config.Bridge.EnableBridging)
+	b.logger.Info("Bridge started", "bridging_enabled", b.config != nil && b.config.Bridge.EnableBridging)
 	return nil
 }
 
@@ -153,7 +161,7 @@ func (b *Bridge) Stop() error {
 	select {
 	case <-done:
 	case <-time.After(3 * time.Second):
-		log.Printf("bridge stop timeout, continuing")
+		b.logger.Warn("Bridge stop timeout, continuing")
 	}
 	b.running = false
 	return nil
@@ -165,7 +173,7 @@ func (b *Bridge) Healthy() bool { return b.running }
 // runBlockBridging polls CometBFT latest height and for each new height triggers the Engine API loop.
 func (b *Bridge) runBlockBridging() {
 	defer b.wg.Done()
-	log.Printf("[bridge] block bridging loop started")
+	b.logger.Info("Block bridging loop started")
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -173,55 +181,63 @@ func (b *Bridge) runBlockBridging() {
 	for {
 		select {
 		case <-b.ctx.Done():
-			log.Printf("[bridge] block bridging loop stopped")
+			b.logger.Info("Block bridging loop stopped")
 			return
 		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(b.ctx, 5*time.Second)
-			status, err := b.consClient.GetStatus(ctx)
-			cancel()
+			currentHeight, err := b.fetchCometHeight()
 			if err != nil {
-				log.Printf("[bridge] get status error: %v", err)
+				b.logger.Error("Failed to fetch CometBFT height", "error", err)
 				continue
 			}
-			// Extract latest_block_height from CometBFT status robustly.
-			var currentHeight int64
-			if syncInfo, ok := status["sync_info"].(map[string]interface{}); ok {
-				if hstr, ok2 := syncInfo["latest_block_height"].(string); ok2 {
-					// Prefer strconv for strict parsing; support both decimal and 0x-prefixed hex just in case.
-					if strings.HasPrefix(hstr, "0x") || strings.HasPrefix(hstr, "0X") {
-						if v, err := strconv.ParseInt(strings.TrimPrefix(strings.ToLower(hstr), "0x"), 16, 64); err == nil {
-							currentHeight = v
-						}
-					} else {
-						if v, err := strconv.ParseInt(hstr, 10, 64); err == nil {
-							currentHeight = v
-						}
-					}
-				}
-			}
+
 			if currentHeight <= lastHeight {
 				continue
 			}
+
 			// Process missing heights sequentially.
 			for h := lastHeight + 1; h <= currentHeight; h++ {
 				if err := b.processHeight(h); err != nil {
-					log.Printf("[bridge] process height %d error: %v", h, err)
-					// Continue trying subsequent heights.
+					b.logger.Error("Failed to process height", "height", h, "error", err)
+					// If we fail to process a height, we stop and retry this height on next tick
+					// effectively blocking progress until this height succeeds.
+					// This is safer than skipping holes.
+					break
 				} else {
 					lastHeight = h
+					// Prune old txs
+					b.txPool.Prune(h - 100)
 				}
 			}
 		}
 	}
 }
 
-func zeroHash() common.Hash { return common.Hash{} }
-
-// dumpJSON is handy for debugging the exact JSON arguments we send to Geth.
-func dumpJSON(tag string, v any) {
-	b, _ := json.Marshal(v)
-	log.Printf("%s %s", tag, string(b))
+func (b *Bridge) fetchCometHeight() (int64, error) {
+	ctx, cancel := context.WithTimeout(b.ctx, 5*time.Second)
+	defer cancel()
+	status, err := b.consClient.GetStatus(ctx)
+	if err != nil {
+		return 0, err
+	}
+	// Extract latest_block_height from CometBFT status robustly.
+	if syncInfo, ok := status["sync_info"].(map[string]interface{}); ok {
+		if hstr, ok2 := syncInfo["latest_block_height"].(string); ok2 {
+			// Prefer strconv for strict parsing; support both decimal and 0x-prefixed hex just in case.
+			if strings.HasPrefix(hstr, "0x") || strings.HasPrefix(hstr, "0X") {
+				if v, err := strconv.ParseInt(strings.TrimPrefix(strings.ToLower(hstr), "0x"), 16, 64); err == nil {
+					return v, nil
+				}
+			} else {
+				if v, err := strconv.ParseInt(hstr, 10, 64); err == nil {
+					return v, nil
+				}
+			}
+		}
+	}
+	return 0, fmt.Errorf("could not parse latest_block_height from status")
 }
+
+func zeroHash() common.Hash { return common.Hash{} }
 
 // getELHead returns the current EL head hash and its timestamp.
 func (b *Bridge) getELHead(ctx context.Context) (common.Hash, uint64, error) {
@@ -274,6 +290,23 @@ func (b *Bridge) getBlockTimestampByHash(ctx context.Context, h common.Hash) uin
 // 3) engine_newPayloadV2(payload) -> VALID/ACCEPTED
 // 4) engine_forkchoiceUpdatedV2(state=head=headOfPayload, safe=head, finalized=head)
 func (b *Bridge) produceBlockAtHeight(height int64) error {
+	// 0) Inject transactions from TxPool into Geth Mempool
+	txs := b.txPool.GetTxs(height)
+	if len(txs) > 0 {
+		b.logger.Info("Injecting transactions into Geth", "height", height, "count", len(txs))
+		ctxTx, cancelTx := context.WithTimeout(b.ctx, 5*time.Second)
+		defer cancelTx()
+		for _, tx := range txs {
+			// Assume tx is RLP-encoded bytes. Convert to hex string for JSON-RPC.
+			txHex := hexutil.Encode(tx)
+			_, err := b.ethClient.Call(ctxTx, "eth_sendRawTransaction", []interface{}{txHex})
+			if err != nil {
+				// Log but continue; maybe it's already in pool or invalid
+				b.logger.Warn("Failed to inject tx", "error", err)
+			}
+		}
+	}
+
 	// 1) Choose parent: prefer last height's head; otherwise EL head; otherwise genesis.
 	parent := b.getHeightHash(height - 1)
 
@@ -334,7 +367,7 @@ func (b *Bridge) produceBlockAtHeight(height int64) error {
 		&fcuReq{Head: parent, Safe: parent, Finalized: parent},
 		attrs,
 	}
-	dumpJSON("engine_forkchoiceUpdatedV2.req", req)
+	// b.logger.Debug("engine_forkchoiceUpdatedV2.req", "req", req)
 	raw, err := b.ethClient.Call(ctx, "engine_forkchoiceUpdatedV2", req)
 	if err != nil {
 		return fmt.Errorf("fcu (with attrs) call: %w", err)
@@ -403,7 +436,7 @@ func (b *Bridge) produceBlockAtHeight(height int64) error {
 
 	// Track mapping: height -> head hash (used to pick parent next time).
 	b.setHeightHash(height, head)
-	log.Printf("[bridge] produced by EL: height=%d head=%s", height, head.Hex())
+	b.logger.Info("Produced block", "height", height, "head", head.Hex(), "txs", len(payload.Transactions))
 	return nil
 }
 
@@ -461,7 +494,7 @@ func (b *Bridge) buildPayloadFromCometBlock(height int64) (*ExecutionPayload, co
 	for _, tx := range resp.Result.Block.Data.Txs {
 		bts, err := base64.StdEncoding.DecodeString(tx) // CometBFT TX are base64
 		if err != nil {
-			log.Printf("[bridge] tx base64 decode failed (height=%d): %v", height, err)
+			b.logger.Warn("tx base64 decode failed", "height", height, "error", err)
 			continue
 		}
 		txBytes = append(txBytes, bts)

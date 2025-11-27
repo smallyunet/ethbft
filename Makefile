@@ -1,4 +1,4 @@
-.PHONY: build run clean test docker-up docker-down docker-rebuild rebuild create-genesis dev-setup
+.PHONY: build run clean test test-e2e docker-up docker-down docker-rebuild rebuild create-genesis dev-setup
 
 # Project variables
 BINARY_NAME=ethbft
@@ -29,6 +29,9 @@ clean:
 
 test:
 	$(GOTEST) -v ./...
+
+test-e2e:
+	$(GOTEST) -v ./e2e/...
 
 # Install dependencies
 deps:

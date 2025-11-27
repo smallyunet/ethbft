@@ -1,10 +1,14 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"math/big"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -61,6 +65,10 @@ func TestE2E(t *testing.T) {
 
 	t.Run("SendTransaction", func(t *testing.T) {
 		testSendTransaction(t, client)
+	})
+
+	t.Run("BridgedTransaction", func(t *testing.T) {
+		testBridgedTransaction(t, client)
 	})
 }
 
@@ -142,6 +150,7 @@ bridge:
   listenAddr: "0.0.0.0:8080"
   logLevel: "debug"
   retryInterval: 1
+  enableBridging: true
 `
 	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte(configContent), 0644); err != nil {
 		return "", err
@@ -227,6 +236,8 @@ func testCheckBalance(t *testing.T, client *ethclient.Client) {
 }
 
 func testSendTransaction(t *testing.T, client *ethclient.Client) {
+	// This test sends directly to Geth, bypassing the bridge logic for ingestion,
+	// but relying on the bridge to produce the block.
 	privateKey, err := crypto.HexToECDSA(testPrivKeyHex)
 	if err != nil {
 		t.Fatalf("Failed to parse private key: %v", err)
@@ -285,6 +296,112 @@ func testSendTransaction(t *testing.T, client *ethclient.Client) {
 	t.Logf("Transaction mined in block %v", receipt.BlockNumber)
 }
 
+func testBridgedTransaction(t *testing.T, client *ethclient.Client) {
+	// This test sends a transaction to CometBFT, which should be bridged to Geth.
+	privateKey, err := crypto.HexToECDSA(testPrivKeyHex)
+	if err != nil {
+		t.Fatalf("Failed to parse private key: %v", err)
+	}
+
+	publicKey := privateKey.Public()
+	publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
+	if !ok {
+		t.Fatal("Cannot assert type: publicKey is not of type *ecdsa.PublicKey")
+	}
+
+	fromAddress := crypto.PubkeyToAddress(*publicKeyECDSA)
+	nonce, err := client.PendingNonceAt(context.Background(), fromAddress)
+	if err != nil {
+		t.Fatalf("Failed to get nonce: %v", err)
+	}
+
+	// Use a slightly different value/toAddress to distinguish from other tests
+	value := big.NewInt(500000000000000000) // 0.5 ETH
+	gasLimit := uint64(21000)
+	gasPrice, err := client.SuggestGasPrice(context.Background())
+	if err != nil {
+		t.Fatalf("Failed to get gas price: %v", err)
+	}
+
+	toAddress := common.HexToAddress("0x9999999999999999999999999999999999999999")
+	chainID, err := client.NetworkID(context.Background())
+	if err != nil {
+		t.Fatalf("Failed to get chainID: %v", err)
+	}
+
+	tx := types.NewTransaction(nonce, toAddress, value, gasLimit, gasPrice, nil)
+	signedTx, err := types.SignTx(tx, types.NewEIP155Signer(chainID), privateKey)
+	if err != nil {
+		t.Fatalf("Failed to sign tx: %v", err)
+	}
+
+	// Encode tx to RLP
+	var buf bytes.Buffer
+	if err := signedTx.EncodeRLP(&buf); err != nil {
+		t.Fatalf("Failed to encode tx: %v", err)
+	}
+	txBytes := buf.Bytes()
+	txBase64 := base64.StdEncoding.EncodeToString(txBytes)
+
+	// Send to CometBFT via broadcast_tx_sync
+	// CometBFT is at localhost:26657
+	cometURL := "http://localhost:26657"
+	reqBody := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      "1",
+		"method":  "broadcast_tx_sync",
+		"params":  []interface{}{txBase64},
+	}
+	reqBytes, _ := json.Marshal(reqBody)
+
+	resp, err := http.Post(cometURL, "application/json", bytes.NewReader(reqBytes))
+	if err != nil {
+		t.Fatalf("Failed to send tx to CometBFT: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("CometBFT returned status %d", resp.StatusCode)
+	}
+
+	// Check response for error
+	var rpcResp struct {
+		Result struct {
+			Code int    `json:"code"`
+			Log  string `json:"log"`
+			Hash string `json:"hash"`
+		} `json:"result"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rpcResp); err != nil {
+		t.Fatalf("Failed to decode CometBFT response: %v", err)
+	}
+	if rpcResp.Error != nil {
+		t.Fatalf("CometBFT RPC error: %s", rpcResp.Error.Message)
+	}
+	if rpcResp.Result.Code != 0 {
+		t.Fatalf("CometBFT broadcast error code %d: %s", rpcResp.Result.Code, rpcResp.Result.Log)
+	}
+
+	t.Logf("Transaction broadcast to CometBFT: %s (CometHash: %s)", signedTx.Hash().Hex(), rpcResp.Result.Hash)
+
+	// Wait for transaction to be mined in Geth
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	receipt, err := waitMinedWithRetry(ctx, client, signedTx)
+	if err != nil {
+		t.Fatalf("Failed to wait for tx mining (bridged): %v", err)
+	}
+
+	if receipt.Status != types.ReceiptStatusSuccessful {
+		t.Errorf("Bridged transaction failed status: %v", receipt.Status)
+	}
+	t.Logf("Bridged transaction mined in block %v", receipt.BlockNumber)
+}
+
 func waitMinedWithRetry(ctx context.Context, client *ethclient.Client, tx *types.Transaction) (*types.Receipt, error) {
 	queryTicker := time.NewTicker(time.Second)
 	defer queryTicker.Stop()
@@ -293,18 +410,6 @@ func waitMinedWithRetry(ctx context.Context, client *ethclient.Client, tx *types
 		receipt, err := client.TransactionReceipt(ctx, tx.Hash())
 		if err == nil {
 			return receipt, nil
-		}
-
-		if err.Error() == "not found" || err.Error() == "transaction indexing is in progress" {
-			// Retry
-		} else {
-			// Check if it's the specific json error structure stringified
-			// "transaction indexing is in progress" might be wrapped
-			// For now, just log and retry if it contains "indexing"
-			// But better to be safe.
-			// Actually, let's just retry on any error until timeout, assuming it's transient.
-			// But real errors should fail.
-			// Geth returns "transaction indexing is in progress" as the error string.
 		}
 
 		// Wait for the next round
