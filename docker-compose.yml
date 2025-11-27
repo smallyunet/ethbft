@@ -22,7 +22,7 @@ services:
       - --http
       - --http.addr=0.0.0.0
       - --http.port=8545
-      - --http.api=eth,net,web3,txpool,admin
+      - --http.api=eth,net,web3,txpool,admin,debug
       - --http.corsdomain=*
       - --http.vhosts=*
       - --ws
@@ -67,3 +67,37 @@ services:
     volumes:
       - ./cometbft_home:/cometbft
       - ./scripts/start-cometbft.sh:/start-cometbft.sh
+
+  otterscan:
+    image: otterscan/otterscan:latest
+    container_name: ethbft-otterscan
+    restart: unless-stopped
+    ports:
+      - "5100:80"
+    depends_on:
+      - geth
+    environment:
+      - ERIGON_URL=http://localhost:8545
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: ethbft-prometheus
+    restart: unless-stopped
+    ports:
+      - "9093:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: ethbft-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - prometheus
+

@@ -1,4 +1,4 @@
-.PHONY: build run clean test test-e2e docker-up docker-down docker-rebuild rebuild create-genesis dev-setup
+.PHONY: build run clean test test-e2e deploy docker-up docker-down docker-rebuild rebuild create-genesis dev-setup
 
 # Project variables
 BINARY_NAME=ethbft
@@ -32,6 +32,10 @@ test:
 
 test-e2e:
 	$(GOTEST) -v ./e2e/...
+
+# Deploy full stack with monitoring and explorer
+deploy:
+	./scripts/deploy.sh
 
 # Install dependencies
 deps:

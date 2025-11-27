@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'ethbft'
+    static_configs:
+      - targets: ['ethbft-app:8081']
+
+  - job_name: 'geth'
+    metrics_path: /debug/metrics/prometheus
+    static_configs:
+      - targets: ['ethbft-geth:6060']

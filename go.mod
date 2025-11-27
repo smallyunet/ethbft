@@ -5,6 +5,7 @@ go 1.23.5
 require (
 	github.com/cometbft/cometbft v0.38.0
 	github.com/ethereum/go-ethereum v1.16.3
+	github.com/prometheus/client_golang v1.15.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -57,7 +58,6 @@ require (
 	github.com/petermattis/goid v0.0.0-20240813172612-4fcff4a6cae7 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	github.com/prometheus/client_golang v1.15.0 // indirect
 	github.com/prometheus/client_model v0.3.0 // indirect
 	github.com/prometheus/common v0.42.0 // indirect
 	github.com/prometheus/procfs v0.9.0 // indirect

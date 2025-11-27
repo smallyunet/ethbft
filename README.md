@@ -61,8 +61,8 @@ Optional (manual run): a locally running Geth with Engine API (authrpc) enabled,
 git clone https://github.com/smallyunet/ethbft.git
 cd ethbft
 
-# Start the complete stack (Geth + CometBFT + EthBFT)
-make docker-up
+# Start the complete stack (Geth + CometBFT + EthBFT + Explorer + Monitoring)
+make deploy
 
 # View logs
 docker-compose logs -f
@@ -73,6 +73,16 @@ make docker-down
 # Rebuild and restart
 make docker-rebuild
 ```
+
+### Access Points
+
+After running `make deploy`, the following services are available:
+
+- **Block Explorer (Otterscan)**: [http://localhost:5100](http://localhost:5100)
+- **Monitoring (Grafana)**: [http://localhost:3000](http://localhost:3000) (User: `admin`, Pass: `admin`)
+- **Prometheus**: [http://localhost:9093](http://localhost:9093)
+- **Geth RPC**: [http://localhost:8545](http://localhost:8545)
+- **CometBFT RPC**: [http://localhost:26657](http://localhost:26657)
 
 ### Manual Setup (Without Docker)
 

@@ -17,6 +17,20 @@ import (
 	abciserver "github.com/cometbft/cometbft/abci/server"
 	abcitypes "github.com/cometbft/cometbft/abci/types"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+var (
+	currentHeight = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "ethbft_current_height",
+		Help: "Current CometBFT block height processed by ABCI",
+	})
+	txsBridged = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "ethbft_txs_bridged_total",
+		Help: "Total number of transactions bridged to Geth",
+	})
 )
 
 // ABCIApplication implements minimal CometBFT ABCI to drive heights.
@@ -69,9 +83,11 @@ func (app *ABCIApplication) ProcessProposal(ctx context.Context, req *abcitypes.
 
 func (app *ABCIApplication) FinalizeBlock(ctx context.Context, req *abcitypes.RequestFinalizeBlock) (*abcitypes.ResponseFinalizeBlock, error) {
 	// Capture transactions and store them in the pool for the bridge to pick up.
+	currentHeight.Set(float64(req.Height))
 	if len(req.Txs) > 0 {
 		app.logger.Info("ABCI FinalizeBlock received txs", "height", req.Height, "count", len(req.Txs))
 		app.bridge.txPool.AddTxs(req.Height, req.Txs)
+		txsBridged.Add(float64(len(req.Txs)))
 	}
 
 	txResults := make([]*abcitypes.ExecTxResult, len(req.Txs))
@@ -283,6 +299,8 @@ func (s *ABCIServer) Start() error {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("OK"))
 	})
+	mux.Handle("/metrics", promhttp.Handler())
+
 	s.httpServer = &http.Server{
 		Addr:              s.healthAddr,
 		Handler:           mux,
@@ -291,12 +309,12 @@ func (s *ABCIServer) Start() error {
 	go func() {
 		ln, err := net.Listen("tcp", s.healthAddr)
 		if err != nil {
-			s.logger.Error("Health server listen error", "error", err)
+			s.logger.Error("Health/Metrics server listen error", "error", err)
 			return
 		}
-		s.logger.Info("Starting HTTP health check server", "addr", s.healthAddr)
+		s.logger.Info("Starting HTTP health/metrics server", "addr", s.healthAddr)
 		if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
-			s.logger.Error("Health server error", "error", err)
+			s.logger.Error("Health/Metrics server error", "error", err)
 		}
 	}()
 
