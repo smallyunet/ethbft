@@ -37,3 +37,5 @@ cometbft_home/
 # OS specific files
 .DS_Store
 Thumbs.db
+
+/e2e/data

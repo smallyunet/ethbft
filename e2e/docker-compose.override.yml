@@ -1,0 +1,16 @@
+services:
+  geth:
+    volumes:
+      - ./e2e/data/geth:/root/.ethereum
+      - ./e2e/data/jwt.hex:/jwt.hex
+      - ./e2e/data/geth/genesis.json:/genesis.json
+
+  ethbft:
+    volumes:
+      - ./e2e/data/config.yaml:/app/config.yaml
+      - ./e2e/data/jwt.hex:/app/jwt.hex
+      - ./e2e/data/cometbft:/cometbft
+
+  cometbft:
+    volumes:
+      - ./e2e/data/cometbft:/cometbft
