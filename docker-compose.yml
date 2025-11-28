@@ -68,16 +68,14 @@ services:
       - ./cometbft_home:/cometbft
       - ./scripts/start-cometbft.sh:/start-cometbft.sh
 
-  otterscan:
-    image: otterscan/otterscan:latest
-    container_name: ethbft-otterscan
+  explorer:
+    image: alethio/ethereum-lite-explorer:latest
+    container_name: ethbft-explorer
     restart: unless-stopped
     ports:
       - "5100:80"
-    depends_on:
-      - geth
     environment:
-      - ERIGON_URL=http://localhost:8545
+      - APP_NODE_URL=http://localhost:8545
 
   prometheus:
     image: prom/prometheus:latest

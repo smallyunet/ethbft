@@ -34,7 +34,7 @@ docker-compose up -d --build --remove-orphans
 echo -e "${BLUE}Deployment Complete!${NC}"
 echo -e "------------------------------------------------"
 echo -e "Services are running at:"
-echo -e "  - ${GREEN}Block Explorer (Otterscan)${NC}: http://localhost:5100"
+echo -e "  - ${GREEN}Block Explorer (Alethio)${NC}:   http://localhost:5100"
 echo -e "  - ${GREEN}Monitoring (Grafana)${NC}:     http://localhost:3000 (user: admin, pass: admin)"
 echo -e "  - ${GREEN}Prometheus${NC}:               http://localhost:9093"
 echo -e "  - ${GREEN}Geth RPC${NC}:                 http://localhost:8545"

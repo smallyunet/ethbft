@@ -78,7 +78,7 @@ make docker-rebuild
 
 After running `make deploy`, the following services are available:
 
-- **Block Explorer (Otterscan)**: [http://localhost:5100](http://localhost:5100)
+- **Block Explorer (Alethio)**: [http://localhost:5100](http://localhost:5100)
 - **Monitoring (Grafana)**: [http://localhost:3000](http://localhost:3000) (User: `admin`, Pass: `admin`)
 - **Prometheus**: [http://localhost:9093](http://localhost:9093)
 - **Geth RPC**: [http://localhost:8545](http://localhost:8545)
