@@ -1,4 +1,4 @@
-.PHONY: build run clean test test-e2e deploy docker-up docker-down docker-rebuild rebuild create-genesis dev-setup
+.PHONY: build run clean test test-e2e deploy docker-up docker-down down docker-rebuild rebuild create-genesis dev-setup deps generate-jwt
 
 # Project variables
 BINARY_NAME=ethbft
@@ -41,10 +41,14 @@ deploy:
 deps:
 	$(GOMOD) download
 
-# Generate JWT secret for Engine API authentication
+# Generate JWT secret for Engine API authentication (skip if exists)
 generate-jwt:
-	printf "%s" "$$(openssl rand -hex 32)" > jwt.hex
-	@echo "JWT secret generated at jwt.hex"
+	@if [ ! -f jwt.hex ]; then \
+		printf "%s" "$$(openssl rand -hex 32)" > jwt.hex; \
+		echo "JWT secret generated at jwt.hex"; \
+	else \
+		echo "JWT secret already exists at jwt.hex, skipping"; \
+	fi
 
 # Create genesis.json file
 create-genesis:
@@ -74,6 +78,9 @@ docker-rebuild: docker-down generate-jwt create-genesis
 	
 # Alias for docker-rebuild for backward compatibility
 rebuild: docker-rebuild
+
+# Alias for docker-down
+down: docker-down
 
 # Development setup
 dev-setup: deps generate-jwt create-genesis

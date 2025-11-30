@@ -4,6 +4,12 @@ services:
     container_name: ethbft-geth
     entrypoint: ["/start-geth.sh"]
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8545"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
     ports:
       - "8545:8545"   # HTTP RPC
       - "8546:8546"   # WebSocket RPC
@@ -43,7 +49,14 @@ services:
     container_name: ethbft-app
     restart: unless-stopped
     depends_on:
-      - geth
+      geth:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "8080"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
     ports:
       - "8080:8080" # ABCI socket
       - "8081:8081" # Health check
@@ -59,7 +72,8 @@ services:
     container_name: ethbft-cometbft
     restart: unless-stopped
     depends_on:
-      - ethbft
+      ethbft:
+        condition: service_healthy
     entrypoint: ["/start-cometbft.sh"]
     ports:
       - "26656:26656"
@@ -70,6 +84,7 @@ services:
 
   explorer:
     image: alethio/ethereum-lite-explorer:latest
+    platform: linux/amd64
     container_name: ethbft-explorer
     restart: unless-stopped
     ports:
@@ -82,7 +97,7 @@ services:
     container_name: ethbft-prometheus
     restart: unless-stopped
     ports:
-      - "9093:9090"
+      - "19090:9090"
     volumes:
       - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
     command:

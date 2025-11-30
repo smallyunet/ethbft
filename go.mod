@@ -1,6 +1,6 @@
 module github.com/smallyunet/ethbft
 
-go 1.23.5
+go 1.24
 
 require (
 	github.com/cometbft/cometbft v0.38.0

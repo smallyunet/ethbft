@@ -10,7 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -25,10 +25,13 @@ type Client struct {
 	httpClient      *http.Client
 	engineAPIClient *http.Client // Dedicated client for Engine API
 	jwtKey          []byte       // JWT secret key bytes
+	logger          *slog.Logger
 }
 
 // NewClient creates a new Ethereum client
 func NewClient(cfg *config.Config) (*Client, error) {
+	logger := slog.Default().With("component", "ethereum_client")
+
 	// Add HTTP client timeout settings
 	httpClient := &http.Client{
 		Timeout: 10 * time.Second, // Set 10 second timeout
@@ -49,14 +52,15 @@ func NewClient(cfg *config.Config) (*Client, error) {
 		return nil, err
 	}
 
-	log.Printf("Initializing Ethereum client, endpoint: %s, Engine API: %s", cfg.Ethereum.Endpoint, cfg.Ethereum.EngineAPI)
-	log.Printf("JWT secret loaded (%d bytes)", len(jwtKey))
+	logger.Info("Initializing Ethereum client", "endpoint", cfg.Ethereum.Endpoint, "engineAPI", cfg.Ethereum.EngineAPI)
+	logger.Info("JWT secret loaded", "bytes", len(jwtKey))
 
 	return &Client{
 		config:          cfg,
 		httpClient:      httpClient,
 		engineAPIClient: engineAPIClient,
 		jwtKey:          jwtKey,
+		logger:          logger,
 	}, nil
 }
 
@@ -122,17 +126,13 @@ func (c *Client) Call(ctx context.Context, method string, params interface{}) (j
 		return nil, err
 	}
 
-	// Add logging for debugging
-	log.Printf("Calling Ethereum method: %s, params: %+v", method, params)
-
 	// Choose the correct endpoint
 	endpoint := c.config.Ethereum.Endpoint
 	if isEngineAPI && c.config.Ethereum.EngineAPI != "" {
 		endpoint = c.config.Ethereum.EngineAPI
-		log.Printf("Using Engine API endpoint: %s", endpoint)
 	}
 
-	log.Printf("Using endpoint: %s", endpoint)
+	c.logger.Debug("Calling Ethereum method", "method", method, "endpoint", endpoint)
 
 	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(requestBody))
 	if err != nil {
@@ -172,25 +172,9 @@ func (c *Client) Call(ctx context.Context, method string, params interface{}) (j
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
-	// Add logging for debugging
-	log.Printf("Ethereum response: %s", string(respBody))
-
 	var response jsonRPCResponse
 	if err := json.Unmarshal(respBody, &response); err != nil {
-		// Add detailed error information for debugging
-		log.Printf("JSON parse failed: %v", err)
-		log.Printf("Raw response: %s", string(respBody))
-
-		// Try to determine where the problem is
-		if strings.Contains(err.Error(), "looking for beginning of value") {
-			// If empty response or format error, log details
-			if len(respBody) > 0 {
-				log.Printf("Problem character position: %c (ASCII: %d)", respBody[0], respBody[0])
-			} else {
-				log.Printf("Response body is empty")
-			}
-		}
-
+		c.logger.Error("JSON parse failed", "error", err, "response", string(respBody))
 		return nil, fmt.Errorf("failed to unmarshal response: %w, raw response: %s", err, string(respBody))
 	}
 
@@ -236,7 +220,7 @@ func (c *Client) CheckConnection(ctx context.Context) (string, error) {
 
 	var lastError error
 	for _, method := range methods {
-		log.Printf("[DEBUG] Trying to verify Ethereum connection using %s method", method)
+		c.logger.Debug("Trying to verify Ethereum connection", "method", method)
 
 		_, err := c.Call(ctx, method, nil)
 		if err == nil {
@@ -245,7 +229,7 @@ func (c *Client) CheckConnection(ctx context.Context) (string, error) {
 		}
 
 		lastError = err
-		log.Printf("[DEBUG] Method %s failed: %v, trying next method", method, err)
+		c.logger.Debug("Method failed, trying next", "method", method, "error", err)
 	}
 
 	return "", fmt.Errorf("All connection methods failed, last error: %v", lastError)

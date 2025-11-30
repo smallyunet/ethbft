@@ -1,0 +1,32 @@
+# Git
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Build artifacts
+ethbft
+*.exe
+
+# Data directories (don't copy into build context)
+geth_data/
+cometbft_home/
+e2e/data/
+
+# Temporary files
+*.log
+*.tmp
+jwt.hex
+
+# Documentation
+README.md
+LICENSE
+docs/
+
+# Test files
+*_test.go
+e2e/
