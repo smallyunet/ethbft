@@ -1,4 +1,4 @@
-.PHONY: build run clean test test-e2e deploy docker-up docker-down down docker-rebuild rebuild create-genesis dev-setup deps generate-jwt
+.PHONY: build run clean test test-e2e deploy docker-up docker-down docker-rebuild generate-jwt create-genesis deps
 
 # Project variables
 BINARY_NAME=ethbft
@@ -7,10 +7,8 @@ MAIN_PKG=./cmd/ethbft
 # Go parameters
 GOCMD=go
 GOBUILD=$(GOCMD) build
-GORUN=$(GOCMD) run
 GOCLEAN=$(GOCMD) clean
 GOTEST=$(GOCMD) test
-GOGET=$(GOCMD) get
 GOMOD=$(GOCMD) mod
 
 all: test build
@@ -75,14 +73,3 @@ docker-rebuild: docker-down generate-jwt create-genesis
 	docker-compose build
 	@echo "Rebuild complete, starting containers..."
 	docker-compose up -d
-	
-# Alias for docker-rebuild for backward compatibility
-rebuild: docker-rebuild
-
-# Alias for docker-down
-down: docker-down
-
-# Development setup
-dev-setup: deps generate-jwt create-genesis
-	cp config/config.yaml ./
-	@echo "Development setup complete"

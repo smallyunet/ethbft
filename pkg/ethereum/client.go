@@ -212,25 +212,3 @@ func (c *Client) generateJWT() (string, error) {
 
 	return signingInput + "." + sigEnc, nil
 }
-
-// CheckConnection verifies connectivity to the Ethereum client
-func (c *Client) CheckConnection(ctx context.Context) (string, error) {
-	// Try multiple possible methods to verify connection
-	methods := []string{"eth_blockNumber", "net_version", "web3_clientVersion"}
-
-	var lastError error
-	for _, method := range methods {
-		c.logger.Debug("Trying to verify Ethereum connection", "method", method)
-
-		_, err := c.Call(ctx, method, nil)
-		if err == nil {
-			// Connection successful
-			return fmt.Sprintf("Connected using %s", method), nil
-		}
-
-		lastError = err
-		c.logger.Debug("Method failed, trying next", "method", method, "error", err)
-	}
-
-	return "", fmt.Errorf("All connection methods failed, last error: %v", lastError)
-}

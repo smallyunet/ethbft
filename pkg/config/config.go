@@ -27,7 +27,6 @@ type Config struct {
 	Bridge struct {
 		ListenAddr     string `yaml:"listenAddr"`     // Address to listen on (e.g., "0.0.0.0:8080")
 		LogLevel       string `yaml:"logLevel"`       // Log level (debug, info, warn, error)
-		RetryInterval  int    `yaml:"retryInterval"`  // Seconds between connection retry attempts
 		EnableBridging bool   `yaml:"enableBridging"` // Whether to enable actual CometBFT->Geth bridging
 	} `yaml:"bridge"`
 }
@@ -48,7 +47,6 @@ func DefaultConfig() *Config {
 	// Default Bridge settings
 	cfg.Bridge.ListenAddr = "0.0.0.0:8080"
 	cfg.Bridge.LogLevel = "info"
-	cfg.Bridge.RetryInterval = 5
 	cfg.Bridge.EnableBridging = true // Default to enabled for actual bridging
 
 	return cfg

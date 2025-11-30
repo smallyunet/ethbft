@@ -145,7 +145,6 @@ cometbft:
 bridge:
   listenAddr: "0.0.0.0:8080"            # ABCI socket address
   logLevel: "info"
-  retryInterval: 5                       # Seconds between connection retries (future use)
   enableBridging: true                   # If false: ABCI server only, no EL block production
 ```
 

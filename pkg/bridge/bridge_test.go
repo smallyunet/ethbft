@@ -18,16 +18,6 @@ func TestParseCometHash(t *testing.T) {
 	}
 }
 
-func TestPseudoHashDeterminism(t *testing.T) {
-	parent := common.HexToHash("0x1234")
-	comet := common.HexToHash("0x5678")
-	h1 := pseudoHash(10, parent, 3, comet)
-	h2 := pseudoHash(10, parent, 3, comet)
-	if h1 != h2 {
-		t.Fatalf("pseudoHash not deterministic: %s vs %s", h1.Hex(), h2.Hex())
-	}
-}
-
 func TestHeightCacheSetGet(t *testing.T) {
 	b := &Bridge{
 		heightToHash: make(map[int64]common.Hash),

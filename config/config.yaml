@@ -10,4 +10,4 @@ cometbft:
 bridge:
   listenAddr: "0.0.0.0:8080"
   logLevel: "info"
-  retryInterval: 5
+  enableBridging: true

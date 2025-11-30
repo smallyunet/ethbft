@@ -2,11 +2,9 @@ package bridge
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"math/big"
 	"strconv"
 	"strings"
 	"sync"
@@ -166,9 +164,6 @@ func (b *Bridge) Stop() error {
 	b.running = false
 	return nil
 }
-
-// Healthy is a basic health indicator.
-func (b *Bridge) Healthy() bool { return b.running }
 
 // runBlockBridging polls CometBFT latest height and for each new height triggers the Engine API loop.
 func (b *Bridge) runBlockBridging() {
@@ -495,128 +490,9 @@ func (b *Bridge) produceBlockAtHeight(height int64) error {
 	return nil
 }
 
-// processHeight now only calls produceBlockAtHeight.
+// processHeight triggers block production for the given CometBFT height.
 func (b *Bridge) processHeight(height int64) error {
-	if err := b.produceBlockAtHeight(height); err != nil {
-		return fmt.Errorf("produceBlockAtHeight: %w", err)
-	}
-	return nil
-}
-
-// -----------------------------------------------------------------------------
-// The two functions below were used for hand-building payloads. Keep them for
-// reference but they are NOT used in the minimal demo (Geth builds the payload).
-// -----------------------------------------------------------------------------
-
-// buildPayloadFromCometBlock maps CometBFT block to an (synthetic) ExecutionPayload.
-// Not used by minimal demo.
-func (b *Bridge) buildPayloadFromCometBlock(height int64) (*ExecutionPayload, common.Hash, error) {
-	ctx, cancel := context.WithTimeout(b.ctx, 5*time.Second)
-	defer cancel()
-	params := map[string]interface{}{"height": fmt.Sprintf("%d", height)}
-	raw, err := b.consClient.Call(ctx, "block", params)
-	if err != nil {
-		return nil, common.Hash{}, err
-	}
-	var resp struct {
-		Result struct {
-			BlockID struct {
-				Hash string `json:"hash"`
-			} `json:"block_id"`
-			Block struct {
-				Header struct {
-					Height      string `json:"height"`
-					Time        string `json:"time"`
-					LastBlockID struct {
-						Hash string `json:"hash"`
-					} `json:"last_block_id"`
-				} `json:"header"`
-				Data struct {
-					Txs []string `json:"txs"`
-				} `json:"data"`
-			} `json:"block"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		return nil, common.Hash{}, fmt.Errorf("decode comet block: %w", err)
-	}
-	cometHash := parseCometHash(resp.Result.BlockID.Hash)
-	var parentHash common.Hash
-	if resp.Result.Block.Header.LastBlockID.Hash != "" {
-		parentHash = parseCometHash(resp.Result.Block.Header.LastBlockID.Hash)
-	}
-	txBytes := make([][]byte, 0, len(resp.Result.Block.Data.Txs))
-	for _, tx := range resp.Result.Block.Data.Txs {
-		bts, err := base64.StdEncoding.DecodeString(tx) // CometBFT TX are base64
-		if err != nil {
-			b.logger.Warn("tx base64 decode failed", "height", height, "error", err)
-			continue
-		}
-		txBytes = append(txBytes, bts)
-	}
-	receiptsRoot := common.HexToHash("0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421") // empty list
-	payload := &ExecutionPayload{
-		ParentHash:    parentHash,
-		FeeRecipient:  common.Address{},
-		StateRoot:     common.Hash{}, // placeholder only
-		ReceiptsRoot:  receiptsRoot,
-		LogsBloom:     make([]byte, 256),
-		Random:        common.Hash{},
-		Number:        uint64(height),
-		GasLimit:      30_000_000,
-		GasUsed:       0,
-		Timestamp:     uint64(time.Now().Unix()),
-		ExtraData:     []byte("ethbft"),
-		BaseFeePerGas: big.NewInt(7),
-		Transactions:  txBytes, // NOT valid for EL unless RLP-encoded ETH txs
-		Withdrawals:   nil,
-	}
-	payload.BlockHash = pseudoHash(height, parentHash, len(txBytes), cometHash)
-	return payload, payload.BlockHash, nil
-}
-
-// buildPlaceholderPayload creates a synthetic payload. Not used by minimal demo.
-func (b *Bridge) buildPlaceholderPayload(height int64) (*ExecutionPayload, error) {
-	var parentHash common.Hash
-	if height > 1 {
-		parentHash = common.BigToHash(big.NewInt((height-1)*1_000_000 + 12345))
-	}
-	receiptsRoot := common.HexToHash("0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
-	return &ExecutionPayload{
-		ParentHash:    parentHash,
-		FeeRecipient:  common.Address{},
-		StateRoot:     common.Hash{},
-		ReceiptsRoot:  receiptsRoot,
-		LogsBloom:     make([]byte, 256),
-		Random:        common.Hash{},
-		Number:        uint64(height),
-		GasLimit:      30_000_000,
-		GasUsed:       0,
-		Timestamp:     uint64(time.Now().Unix()),
-		ExtraData:     []byte("ethbft"),
-		BaseFeePerGas: big.NewInt(7),
-		BlockHash:     pseudoHash(height, parentHash, 0, common.Hash{}),
-		Transactions:  [][]byte{},
-		Withdrawals:   nil,
-	}, nil
-}
-
-// updateForkchoice computes safe/finalized from history and calls engine_forkchoiceUpdatedV2.
-// Not used by minimal demo; we set head/safe/finalized to the same hash when producing.
-func (b *Bridge) updateForkchoice(headHeight int64, headHash common.Hash) error {
-	safeHash := headHash
-	if h := headHeight - 2; h > 0 {
-		if hh := b.getHeightHash(h); hh != (common.Hash{}) {
-			safeHash = hh
-		}
-	}
-	finalizedHash := safeHash
-	if h := headHeight - 5; h > 0 {
-		if hh := b.getHeightHash(h); hh != (common.Hash{}) {
-			finalizedHash = hh
-		}
-	}
-	return b.sendForkchoiceUpdate(headHash, safeHash, finalizedHash)
+	return b.produceBlockAtHeight(height)
 }
 
 // parseCometHash converts upper-case/no-0x hex to go-ethereum common.Hash (0x-prefixed, lower-case).
@@ -629,30 +505,6 @@ func parseCometHash(h string) common.Hash {
 		hs = "0x" + strings.ToLower(hs)
 	}
 	return common.HexToHash(hs)
-}
-
-// sendNewPayload is kept for reference. Minimal demo uses newPayloadV2 inside produceBlockAtHeight.
-func (b *Bridge) sendNewPayload(p *ExecutionPayload) error {
-	ctx, cancel := context.WithTimeout(b.ctx, 8*time.Second)
-	defer cancel()
-	res, err := b.ethClient.Call(ctx, "engine_newPayloadV2", []interface{}{p})
-	if err != nil {
-		return err
-	}
-	var resp struct {
-		Status          string `json:"status"`
-		LatestValidHash string `json:"latestValidHash"`
-		ValidationError string `json:"validationError"`
-	}
-	if err := json.Unmarshal(res, &resp); err != nil {
-		return fmt.Errorf("decode newPayload: %w", err)
-	}
-	switch resp.Status {
-	case "VALID", "ACCEPTED", "SYNCING":
-	default:
-		return fmt.Errorf("payload status=%s validationError=%s", resp.Status, resp.ValidationError)
-	}
-	return nil
 }
 
 // sendForkchoiceUpdate sets head/safe/finalized. Used both before and after producing a block.
@@ -686,15 +538,4 @@ func (b *Bridge) sendForkchoiceUpdate(head, safe, finalized common.Hash) error {
 		return fmt.Errorf("forkchoice status=%s validationError=%s", resp.PayloadStatus.Status, resp.PayloadStatus.ValidationError)
 	}
 	return nil
-}
-
-// pseudoHash creates a deterministic synthetic hash; kept only for legacy helpers.
-func pseudoHash(height int64, parent common.Hash, txCount int, cometHash common.Hash) common.Hash {
-	h := new(big.Int).SetInt64(height & 0xFFFFFFFFFFFF) // 48 bits height
-	h.Lsh(h, 16).Or(h, new(big.Int).SetInt64(int64(txCount&0xFFFF)))
-	cometPart := new(big.Int).SetBytes(cometHash.Bytes()[20:32])
-	h.Lsh(h, 96).Or(h, cometPart)
-	parentPart := new(big.Int).SetBytes(parent.Bytes()[20:32])
-	h.Lsh(h, 96).Or(h, parentPart)
-	return common.BigToHash(h)
 }

@@ -2,21 +2,14 @@ package bridge
 
 import (
 	"context"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"log/slog"
-	"math/big"
 	"net"
 	"net/http"
-	"strconv"
-	"strings"
-	"sync"
 	"time"
 
 	abciserver "github.com/cometbft/cometbft/abci/server"
 	abcitypes "github.com/cometbft/cometbft/abci/types"
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -34,12 +27,9 @@ var (
 )
 
 // ABCIApplication implements minimal CometBFT ABCI to drive heights.
-// We do not execute transactions here for the demo; Geth builds empty blocks.
 type ABCIApplication struct {
-	bridge        *Bridge
-	lastPayload   *ExecutionPayload
-	lastPayloadMu sync.RWMutex
-	logger        *slog.Logger
+	bridge *Bridge
+	logger *slog.Logger
 }
 
 func NewABCIApplication(bridge *Bridge) *ABCIApplication {
@@ -124,135 +114,6 @@ func (app *ABCIApplication) LoadSnapshotChunk(ctx context.Context, req *abcitype
 
 func (app *ABCIApplication) ApplySnapshotChunk(ctx context.Context, req *abcitypes.RequestApplySnapshotChunk) (*abcitypes.ResponseApplySnapshotChunk, error) {
 	return &abcitypes.ResponseApplySnapshotChunk{}, nil
-}
-
-// --- Convenience helpers retained for optional fallback/debug ---
-
-// GetPendingPayload returns the last payload we saw or a best-effort latest block from EL.
-func (app *ABCIApplication) GetPendingPayload(ctx context.Context) (*ExecutionPayload, error) {
-	app.lastPayloadMu.RLock()
-	if app.lastPayload != nil {
-		defer app.lastPayloadMu.RUnlock()
-		return app.lastPayload, nil
-	}
-	app.lastPayloadMu.RUnlock()
-
-	if app.bridge.ethClient == nil {
-		return nil, fmt.Errorf("ethereum client not available")
-	}
-	result, err := app.bridge.ethClient.Call(ctx, "eth_getBlockByNumber", []interface{}{"latest", false})
-	if err != nil {
-		return nil, fmt.Errorf("failed to get block from Geth: %w", err)
-	}
-	var block map[string]interface{}
-	if err := json.Unmarshal(result, &block); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal block: %w", err)
-	}
-	hexToUint64 := func(s string) uint64 {
-		var v uint64
-		_, _ = fmt.Sscanf(strings.TrimPrefix(s, "0x"), "%x", &v)
-		return v
-	}
-	payload := &ExecutionPayload{
-		ParentHash:   common.HexToHash(getStringField(block, "parentHash")),
-		FeeRecipient: common.HexToAddress(getStringField(block, "miner")),
-		StateRoot:    common.HexToHash(getStringField(block, "stateRoot")),
-		ReceiptsRoot: common.HexToHash(getStringField(block, "receiptsRoot")),
-		LogsBloom: func() []byte {
-			b, _ := hex.DecodeString(strings.TrimPrefix(getStringField(block, "logsBloom"), "0x"))
-			// Ensure logs bloom is exactly 256 bytes (2048 bits) as expected by EL types.
-			if len(b) < 256 {
-				pad := make([]byte, 256)
-				copy(pad[256-len(b):], b)
-				return pad
-			}
-			if len(b) > 256 {
-				return b[len(b)-256:]
-			}
-			return b
-		}(),
-		Random:    common.HexToHash(getStringField(block, "mixHash")),
-		Number:    hexToUint64(getStringField(block, "number")),
-		GasLimit:  hexToUint64(getStringField(block, "gasLimit")),
-		GasUsed:   hexToUint64(getStringField(block, "gasUsed")),
-		Timestamp: hexToUint64(getStringField(block, "timestamp")),
-		ExtraData: func() []byte {
-			d, _ := hex.DecodeString(strings.TrimPrefix(getStringField(block, "extraData"), "0x"))
-			return d
-		}(),
-		BaseFeePerGas: func() *big.Int {
-			bf, _ := new(big.Int).SetString(strings.TrimPrefix(getStringField(block, "baseFeePerGas"), "0x"), 16)
-			return bf
-		}(),
-		BlockHash:    common.HexToHash(getStringField(block, "hash")),
-		Transactions: [][]byte{},
-		Withdrawals:  nil,
-	}
-	app.logger.Info("Fallback payload from EL", "number", payload.Number, "hash", payload.BlockHash.Hex())
-	return payload, nil
-}
-
-// Safe getter for a string field; returns a 32-byte zero hex for missing hashes.
-func getStringField(block map[string]interface{}, field string) string {
-	if value, ok := block[field].(string); ok && value != "" {
-		return value
-	}
-	return "0x" + strings.Repeat("0", 64)
-}
-
-func (app *ABCIApplication) ExecutePayload(ctx context.Context, payload *ExecutionPayload) error {
-	app.lastPayloadMu.Lock()
-	app.lastPayload = payload
-	app.lastPayloadMu.Unlock()
-	return nil
-}
-
-func (app *ABCIApplication) UpdateForkchoice(ctx context.Context, state *ForkchoiceState) error {
-	// Not used in the minimal demo.
-	return nil
-}
-
-func (app *ABCIApplication) GetLatestBlock(ctx context.Context) (height int64, hash string, err error) {
-	status, err := app.bridge.consClient.GetStatus(ctx)
-	if err != nil {
-		app.logger.Warn("Failed to get CometBFT status", "error", err)
-		return 0, "0x" + strings.Repeat("0", 64), nil
-	}
-	if syncInfo, ok := status["sync_info"].(map[string]interface{}); ok {
-		if heightStr, ok := syncInfo["latest_block_height"].(string); ok {
-			if parsed, err := strconv.ParseInt(heightStr, 10, 64); err == nil {
-				height = parsed
-			}
-		}
-		// For demo we return EL latest state root as "hash" (not required anymore).
-		if gethStateRoot, err := app.getGethStateRoot(ctx, height); err == nil {
-			return height, gethStateRoot, nil
-		}
-		if hashStr, ok := syncInfo["latest_block_hash"].(string); ok {
-			return height, "0x" + strings.ToLower(hashStr), nil
-		}
-	}
-	return 0, "0x" + strings.Repeat("0", 64), nil
-}
-
-func (app *ABCIApplication) getGethStateRoot(ctx context.Context, height int64) (string, error) {
-	if app.bridge.ethClient == nil {
-		return "", fmt.Errorf("ethereum client not available")
-	}
-	result, err := app.bridge.ethClient.Call(ctx, "eth_getBlockByNumber", []interface{}{"latest", false})
-	if err != nil {
-		return "", fmt.Errorf("failed to get block from Geth: %w", err)
-	}
-	var block map[string]interface{}
-	if err := json.Unmarshal(result, &block); err != nil {
-		return "", fmt.Errorf("failed to unmarshal block: %w", err)
-	}
-	stateRoot, ok := block["stateRoot"].(string)
-	if !ok {
-		return "", fmt.Errorf("state root not found in block")
-	}
-	// app.logger.Debug("Retrieved EL state root", "height", height, "stateRoot", stateRoot)
-	return stateRoot, nil
 }
 
 // ABCIServer wraps the official CometBFT ABCI socket server plus an HTTP health endpoint.
