@@ -42,11 +42,11 @@ func TestE2E(t *testing.T) {
 
 	// 2. Start Docker environment
 	t.Log("Starting Docker environment...")
-	cmd := exec.Command("docker-compose",
-		"-f", "docker-compose.yml",
-		"-f", "e2e/docker-compose.override.yml",
-		"up", "-d", "--build",
-	)
+	args := []string{"-f", "docker-compose.yml", "-f", "e2e/docker-compose.override.yml", "up", "-d"}
+	if os.Getenv("ETHBFT_E2E_NO_BUILD") != "1" {
+		args = append(args, "--build")
+	}
+	cmd := exec.Command("docker-compose", args...)
 	cmd.Dir = rootDir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -61,6 +61,11 @@ func TestE2E(t *testing.T) {
 		t.Fatalf("Geth failed to become ready: %v", err)
 	}
 	defer client.Close()
+
+	// Wait for CometBFT as well
+	if err := waitForCometBFT(t, "http://localhost:26657"); err != nil {
+		t.Fatalf("CometBFT failed to become ready: %v", err)
+	}
 
 	// 4. Run tests
 	t.Run("CheckBalance", func(t *testing.T) {
@@ -224,6 +229,32 @@ func waitForGeth(t *testing.T, url string) (*ethclient.Client, error) {
 	}
 }
 
+func waitForCometBFT(t *testing.T, url string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	statusURL := fmt.Sprintf("%s/status", url)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timeout waiting for CometBFT")
+		case <-ticker.C:
+			resp, err := http.Get(statusURL)
+			if err != nil {
+				continue
+			}
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+		}
+	}
+}
+
 func testCheckBalance(t *testing.T, client *ethclient.Client) {
 	account := common.HexToAddress(testAddr)
 	balance, err := client.BalanceAt(context.Background(), account, nil)
@@ -239,9 +270,7 @@ func testCheckBalance(t *testing.T, client *ethclient.Client) {
 	}
 }
 
-func testSendTransaction(t *testing.T, client *ethclient.Client) {
-	// This test sends directly to Geth, bypassing the bridge logic for ingestion,
-	// but relying on the bridge to produce the block.
+func createSignedTx(t *testing.T, client *ethclient.Client, toAddress common.Address, value *big.Int) (*types.Transaction, *ecdsa.PrivateKey) {
 	privateKey, err := crypto.HexToECDSA(testPrivKeyHex)
 	if err != nil {
 		t.Fatalf("Failed to parse private key: %v", err)
@@ -259,14 +288,12 @@ func testSendTransaction(t *testing.T, client *ethclient.Client) {
 		t.Fatalf("Failed to get nonce: %v", err)
 	}
 
-	value := big.NewInt(1000000000000000000) // 1 ETH
 	gasLimit := uint64(21000)
 	gasPrice, err := client.SuggestGasPrice(context.Background())
 	if err != nil {
 		t.Fatalf("Failed to get gas price: %v", err)
 	}
 
-	toAddress := common.HexToAddress("0x70997970C51812dc3A010C7d01b50e0d17dc79C8") // Another test address
 	chainID, err := client.NetworkID(context.Background())
 	if err != nil {
 		t.Fatalf("Failed to get chainID: %v", err)
@@ -277,8 +304,18 @@ func testSendTransaction(t *testing.T, client *ethclient.Client) {
 	if err != nil {
 		t.Fatalf("Failed to sign tx: %v", err)
 	}
+	return signedTx, privateKey
+}
 
-	err = client.SendTransaction(context.Background(), signedTx)
+func testSendTransaction(t *testing.T, client *ethclient.Client) {
+	// This test sends directly to Geth, bypassing the bridge logic for ingestion,
+	// but relying on the bridge to produce the block.
+	toAddress := common.HexToAddress("0x70997970C51812dc3A010C7d01b50e0d17dc79C8") // Another test address
+	value := big.NewInt(1000000000000000000)                                     // 1 ETH
+
+	signedTx, _ := createSignedTx(t, client, toAddress, value)
+
+	err := client.SendTransaction(context.Background(), signedTx)
 	if err != nil {
 		t.Fatalf("Failed to send tx: %v", err)
 	}
@@ -302,42 +339,10 @@ func testSendTransaction(t *testing.T, client *ethclient.Client) {
 
 func testBridgedTransaction(t *testing.T, client *ethclient.Client) {
 	// This test sends a transaction to CometBFT, which should be bridged to Geth.
-	privateKey, err := crypto.HexToECDSA(testPrivKeyHex)
-	if err != nil {
-		t.Fatalf("Failed to parse private key: %v", err)
-	}
-
-	publicKey := privateKey.Public()
-	publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
-	if !ok {
-		t.Fatal("Cannot assert type: publicKey is not of type *ecdsa.PublicKey")
-	}
-
-	fromAddress := crypto.PubkeyToAddress(*publicKeyECDSA)
-	nonce, err := client.PendingNonceAt(context.Background(), fromAddress)
-	if err != nil {
-		t.Fatalf("Failed to get nonce: %v", err)
-	}
-
-	// Use a slightly different value/toAddress to distinguish from other tests
-	value := big.NewInt(500000000000000000) // 0.5 ETH
-	gasLimit := uint64(21000)
-	gasPrice, err := client.SuggestGasPrice(context.Background())
-	if err != nil {
-		t.Fatalf("Failed to get gas price: %v", err)
-	}
-
 	toAddress := common.HexToAddress("0x9999999999999999999999999999999999999999")
-	chainID, err := client.NetworkID(context.Background())
-	if err != nil {
-		t.Fatalf("Failed to get chainID: %v", err)
-	}
+	value := big.NewInt(500000000000000000) // 0.5 ETH
 
-	tx := types.NewTransaction(nonce, toAddress, value, gasLimit, gasPrice, nil)
-	signedTx, err := types.SignTx(tx, types.NewEIP155Signer(chainID), privateKey)
-	if err != nil {
-		t.Fatalf("Failed to sign tx: %v", err)
-	}
+	signedTx, _ := createSignedTx(t, client, toAddress, value)
 
 	// Encode tx to RLP
 	var buf bytes.Buffer

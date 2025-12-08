@@ -55,6 +55,10 @@ func (app *ABCIApplication) Query(ctx context.Context, req *abcitypes.RequestQue
 }
 
 func (app *ABCIApplication) CheckTx(ctx context.Context, req *abcitypes.RequestCheckTx) (*abcitypes.ResponseCheckTx, error) {
+	// Basic validation: check size
+	if len(req.Tx) > 128*1024 { // 128KB limit
+		return &abcitypes.ResponseCheckTx{Code: 1, Log: "tx too large"}, nil
+	}
 	return &abcitypes.ResponseCheckTx{Code: abcitypes.CodeTypeOK}, nil
 }
 

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +15,10 @@ import (
 	"github.com/smallyunet/ethbft/pkg/config"
 	"github.com/smallyunet/ethbft/pkg/consensus"
 	"github.com/smallyunet/ethbft/pkg/ethereum"
+)
+
+const (
+	pruneDepth = 100
 )
 
 // Bridge wires CometBFT (consensus) to a Geth execution client via the Engine API.
@@ -229,7 +232,7 @@ func (b *Bridge) runBlockBridging() {
 					break
 				} else {
 					lastHeight = i
-					b.txPool.Prune(i - 100)
+					b.txPool.Prune(i - pruneDepth)
 				}
 			}
 		}
@@ -268,7 +271,7 @@ func (b *Bridge) runPollingLoop() {
 					break
 				} else {
 					lastHeight = h
-					b.txPool.Prune(h - 100)
+					b.txPool.Prune(h - pruneDepth)
 				}
 			}
 		}
@@ -286,22 +289,7 @@ func (b *Bridge) fetchCometHeight() (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	// Extract latest_block_height from CometBFT status robustly.
-	if syncInfo, ok := status["sync_info"].(map[string]interface{}); ok {
-		if hstr, ok2 := syncInfo["latest_block_height"].(string); ok2 {
-			// Prefer strconv for strict parsing; support both decimal and 0x-prefixed hex just in case.
-			if strings.HasPrefix(hstr, "0x") || strings.HasPrefix(hstr, "0X") {
-				if v, err := strconv.ParseInt(strings.TrimPrefix(strings.ToLower(hstr), "0x"), 16, 64); err == nil {
-					return v, nil
-				}
-			} else {
-				if v, err := strconv.ParseInt(hstr, 10, 64); err == nil {
-					return v, nil
-				}
-			}
-		}
-	}
-	return 0, fmt.Errorf("could not parse latest_block_height from status")
+	return status.SyncInfo.LatestBlockHeight, nil
 }
 
 func zeroHash() common.Hash { return common.Hash{} }
