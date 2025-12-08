@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,6 +29,7 @@ type Config struct {
 		ListenAddr     string `yaml:"listenAddr"`     // Address to listen on (e.g., "0.0.0.0:8080")
 		LogLevel       string `yaml:"logLevel"`       // Log level (debug, info, warn, error)
 		EnableBridging bool   `yaml:"enableBridging"` // Whether to enable actual CometBFT->Geth bridging
+		Timeout        int    `yaml:"timeout"`        // Global timeout in seconds for operations
 	} `yaml:"bridge"`
 }
 
@@ -48,6 +50,7 @@ func DefaultConfig() *Config {
 	cfg.Bridge.ListenAddr = "0.0.0.0:8080"
 	cfg.Bridge.LogLevel = "info"
 	cfg.Bridge.EnableBridging = true // Default to enabled for actual bridging
+	cfg.Bridge.Timeout = 10          // Default 10s timeout
 
 	return cfg
 }
@@ -77,14 +80,12 @@ func Load() (*Config, error) {
 
 	// Override with environment variables if provided
 	if host := os.Getenv("ETHEREUM_HOST"); host != "" {
-		// Replace localhost with the Docker service name
-		cfg.Ethereum.Endpoint = strings.Replace(cfg.Ethereum.Endpoint, "localhost", host, 1)
-		cfg.Ethereum.EngineAPI = strings.Replace(cfg.Ethereum.EngineAPI, "localhost", host, 1)
+		cfg.Ethereum.Endpoint = replaceHost(cfg.Ethereum.Endpoint, host)
+		cfg.Ethereum.EngineAPI = replaceHost(cfg.Ethereum.EngineAPI, host)
 	}
 
 	if host := os.Getenv("COMETBFT_HOST"); host != "" {
-		// Replace localhost with the Docker service name
-		cfg.CometBFT.Endpoint = strings.Replace(cfg.CometBFT.Endpoint, "localhost", host, 1)
+		cfg.CometBFT.Endpoint = replaceHost(cfg.CometBFT.Endpoint, host)
 	}
 
 	// Ensure directories exist
@@ -97,6 +98,28 @@ func Load() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func replaceHost(rawURL, newHost string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		// Fallback to simple replacement if parsing fails
+		return strings.Replace(rawURL, "localhost", newHost, 1)
+	}
+	
+	// Handle host with port
+	host := u.Host
+	port := ""
+	if strings.Contains(host, ":") {
+		parts := strings.Split(host, ":")
+		host = parts[0]
+		if len(parts) > 1 {
+			port = ":" + parts[1]
+		}
+	}
+	
+	u.Host = newHost + port
+	return u.String()
 }
 
 // Save writes the configuration to a file

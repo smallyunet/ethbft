@@ -33,13 +33,18 @@ func NewClient(cfg *config.Config) (*Client, error) {
 	logger := slog.Default().With("component", "ethereum_client")
 
 	// Add HTTP client timeout settings
+	timeout := 10 * time.Second
+	if cfg.Bridge.Timeout > 0 {
+		timeout = time.Duration(cfg.Bridge.Timeout) * time.Second
+	}
+
 	httpClient := &http.Client{
-		Timeout: 10 * time.Second, // Set 10 second timeout
+		Timeout: timeout,
 	}
 
 	// Create a dedicated HTTP client for Engine API
 	engineAPIClient := &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout: timeout,
 	}
 
 	// Validate Ethereum endpoint format

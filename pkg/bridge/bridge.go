@@ -103,7 +103,11 @@ func NewBridge(cfg *config.Config) (*Bridge, error) {
 
 	// Try to read EL genesis hash (block 0). If not found, keep zero hash as fallback.
 	{
-		ctx2, cancel2 := context.WithTimeout(ctx, 5*time.Second)
+		timeout := 5 * time.Second
+		if cfg.Bridge.Timeout > 0 {
+			timeout = time.Duration(cfg.Bridge.Timeout) * time.Second
+		}
+		ctx2, cancel2 := context.WithTimeout(ctx, timeout)
 		defer cancel2()
 		res, err := ethClient.Call(ctx2, "eth_getBlockByNumber", []interface{}{"0x0", false})
 		if err == nil {
@@ -272,7 +276,11 @@ func (b *Bridge) runPollingLoop() {
 }
 
 func (b *Bridge) fetchCometHeight() (int64, error) {
-	ctx, cancel := context.WithTimeout(b.ctx, 5*time.Second)
+	timeout := 5 * time.Second
+	if b.config.Bridge.Timeout > 0 {
+		timeout = time.Duration(b.config.Bridge.Timeout) * time.Second
+	}
+	ctx, cancel := context.WithTimeout(b.ctx, timeout)
 	defer cancel()
 	status, err := b.consClient.GetStatus(ctx)
 	if err != nil {
@@ -351,9 +359,14 @@ func (b *Bridge) getBlockTimestampByHash(ctx context.Context, h common.Hash) uin
 func (b *Bridge) produceBlockAtHeight(height int64) error {
 	// 0) Inject transactions from TxPool into Geth Mempool
 	txs := b.txPool.GetTxs(height)
+	timeout := 8 * time.Second
+	if b.config.Bridge.Timeout > 0 {
+		timeout = time.Duration(b.config.Bridge.Timeout) * time.Second
+	}
+
 	if len(txs) > 0 {
 		b.logger.Info("Injecting transactions into Geth", "height", height, "count", len(txs))
-		ctxTx, cancelTx := context.WithTimeout(b.ctx, 5*time.Second)
+		ctxTx, cancelTx := context.WithTimeout(b.ctx, timeout)
 		defer cancelTx()
 		for _, tx := range txs {
 			// Assume tx is RLP-encoded bytes. Convert to hex string for JSON-RPC.
@@ -372,7 +385,7 @@ func (b *Bridge) produceBlockAtHeight(height int64) error {
 	// Determine a sane parent and parent timestamp.
 	var parentTs uint64
 	if (parent == common.Hash{}) {
-		ctxHead, cancelHead := context.WithTimeout(b.ctx, 4*time.Second)
+		ctxHead, cancelHead := context.WithTimeout(b.ctx, timeout)
 		head, headTs, err := b.getELHead(ctxHead)
 		cancelHead()
 		if err == nil && (head != common.Hash{}) {
@@ -381,13 +394,13 @@ func (b *Bridge) produceBlockAtHeight(height int64) error {
 		} else if b.elGenesis != (common.Hash{}) {
 			parent = b.elGenesis
 			// best-effort get genesis timestamp
-			ctxTs, cancelTs := context.WithTimeout(b.ctx, 4*time.Second)
+			ctxTs, cancelTs := context.WithTimeout(b.ctx, timeout)
 			parentTs = b.getBlockTimestampByHash(ctxTs, parent)
 			cancelTs()
 		}
 	} else {
 		// We had a cached parent; fetch its timestamp.
-		ctxTs, cancelTs := context.WithTimeout(b.ctx, 4*time.Second)
+		ctxTs, cancelTs := context.WithTimeout(b.ctx, timeout)
 		parentTs = b.getBlockTimestampByHash(ctxTs, parent)
 		cancelTs()
 	}
@@ -415,7 +428,7 @@ func (b *Bridge) produceBlockAtHeight(height int64) error {
 	}
 
 	// 4) Forkchoice with attributes to get payloadId.
-	ctx, cancel := context.WithTimeout(b.ctx, 8*time.Second)
+	ctx, cancel := context.WithTimeout(b.ctx, timeout)
 	defer cancel()
 	type fcuReq struct {
 		Head      common.Hash `json:"headBlockHash"`
@@ -518,7 +531,11 @@ func parseCometHash(h string) common.Hash {
 
 // sendForkchoiceUpdate sets head/safe/finalized. Used both before and after producing a block.
 func (b *Bridge) sendForkchoiceUpdate(head, safe, finalized common.Hash) error {
-	ctx, cancel := context.WithTimeout(b.ctx, 8*time.Second)
+	timeout := 8 * time.Second
+	if b.config.Bridge.Timeout > 0 {
+		timeout = time.Duration(b.config.Bridge.Timeout) * time.Second
+	}
+	ctx, cancel := context.WithTimeout(b.ctx, timeout)
 	defer cancel()
 	type fcuReq struct {
 		Head      common.Hash `json:"headBlockHash"`
