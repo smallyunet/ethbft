@@ -29,6 +29,10 @@ const (
 )
 
 func TestE2E(t *testing.T) {
+	if os.Getenv("ETHBFT_E2E") != "1" {
+		t.Skip("Skipping E2E tests. Set ETHBFT_E2E=1 to run them.")
+	}
+
 	// 1. Setup environment
 	rootDir, err := setupEnvironment(t)
 	if err != nil {

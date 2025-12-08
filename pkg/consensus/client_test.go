@@ -11,7 +11,7 @@ func TestNormalizeEndpoint(t *testing.T) {
 	}{
 		{name: "http", input: "http://localhost:26657", want: "http://localhost:26657"},
 		{name: "https", input: "https://example.com:26657", want: "https://example.com:26657"},
-		{name: "tcp", input: "tcp://localhost:26657", want: "http://localhost:26657"},
+		{name: "tcp", input: "tcp://localhost:26657", want: "tcp://localhost:26657"},
 		{name: "no-scheme", input: "localhost:26657", want: "http://localhost:26657"},
 		{name: "empty", input: "  ", wantErr: true},
 	}

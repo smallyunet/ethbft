@@ -153,6 +153,11 @@ func (b *Bridge) Stop() error {
 	if b.abciServer != nil {
 		b.abciServer.Stop()
 	}
+	if b.consClient != nil {
+		if err := b.consClient.Stop(); err != nil {
+			b.logger.Error("Failed to stop consensus client", "error", err)
+		}
+	}
 	b.cancel()
 	done := make(chan struct{})
 	go func() { b.wg.Wait(); close(done) }()
@@ -177,7 +182,11 @@ func (b *Bridge) runBlockBridging() {
 		b.runPollingLoop()
 		return
 	}
-	defer b.consClient.UnsubscribeAll(context.Background())
+	defer func() {
+		if err := b.consClient.UnsubscribeAll(context.Background()); err != nil {
+			b.logger.Error("Failed to unsubscribe from all events", "error", err)
+		}
+	}()
 
 	var lastHeight int64 = 0
 

@@ -187,11 +187,15 @@ func (s *ABCIServer) Start() error {
 
 func (s *ABCIServer) Stop() {
 	if s.srv != nil {
-		_ = s.srv.Stop()
+		if err := s.srv.Stop(); err != nil {
+			s.logger.Error("Failed to stop ABCI server", "error", err)
+		}
 	}
 	if s.httpServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = s.httpServer.Shutdown(ctx)
+		if err := s.httpServer.Shutdown(ctx); err != nil {
+			s.logger.Error("Failed to shutdown health server", "error", err)
+		}
 	}
 }

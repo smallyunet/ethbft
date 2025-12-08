@@ -194,3 +194,8 @@ func (c *Client) SubscribeNewBlocks(ctx context.Context) (<-chan int64, error) {
 func (c *Client) UnsubscribeAll(ctx context.Context) error {
 	return c.rpcClient.UnsubscribeAll(ctx, "ethbft-bridge")
 }
+
+// Stop stops the CometBFT client
+func (c *Client) Stop() error {
+	return c.rpcClient.Stop()
+}
