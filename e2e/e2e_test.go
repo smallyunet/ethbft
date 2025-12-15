@@ -46,7 +46,7 @@ func TestE2E(t *testing.T) {
 	if os.Getenv("ETHBFT_E2E_NO_BUILD") != "1" {
 		args = append(args, "--build")
 	}
-	cmd := exec.Command("docker-compose", args...)
+	cmd := getDockerComposeCommand(args...)
 	cmd.Dir = rootDir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -172,7 +172,7 @@ func teardownEnvironment(t *testing.T, rootDir string) {
 	if t.Failed() {
 		t.Log("Test failed, keeping environment for debugging")
 		// Print logs
-		cmdLogs := exec.Command("docker-compose",
+		cmdLogs := getDockerComposeCommand(
 			"-f", "docker-compose.yml",
 			"-f", "e2e/docker-compose.override.yml",
 			"logs", "--tail=100",
@@ -184,7 +184,7 @@ func teardownEnvironment(t *testing.T, rootDir string) {
 	}
 
 	t.Log("Tearing down Docker environment...")
-	cmd := exec.Command("docker-compose",
+	cmd := getDockerComposeCommand(
 		"-f", "docker-compose.yml",
 		"-f", "e2e/docker-compose.override.yml",
 		"down", "-v",
@@ -429,3 +429,13 @@ func waitMinedWithRetry(ctx context.Context, client *ethclient.Client, tx *types
 		}
 	}
 }
+
+func getDockerComposeCommand(args ...string) *exec.Cmd {
+	if _, err := exec.LookPath("docker-compose"); err == nil {
+		return exec.Command("docker-compose", args...)
+	}
+	// Fallback to "docker compose"
+	newArgs := append([]string{"compose"}, args...)
+	return exec.Command("docker", newArgs...)
+}
+
