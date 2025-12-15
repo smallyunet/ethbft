@@ -10,6 +10,8 @@ import (
 
 	abciserver "github.com/cometbft/cometbft/abci/server"
 	abcitypes "github.com/cometbft/cometbft/abci/types"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -23,6 +25,15 @@ var (
 	txsBridged = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "ethbft_txs_bridged_total",
 		Help: "Total number of transactions bridged to Geth",
+	})
+	rpcErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "ethbft_rpc_errors_total",
+		Help: "Total number of RPC errors communicating with Geth or CometBFT",
+	})
+	blockProductionDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "ethbft_block_production_duration_seconds",
+		Help:    "Time taken to produce a block via Engine API",
+		Buckets: prometheus.DefBuckets,
 	})
 )
 
@@ -59,6 +70,16 @@ func (app *ABCIApplication) CheckTx(ctx context.Context, req *abcitypes.RequestC
 	if len(req.Tx) > 128*1024 { // 128KB limit
 		return &abcitypes.ResponseCheckTx{Code: 1, Log: "tx too large"}, nil
 	}
+
+	// Decode transaction to ensure it is a valid Ethereum transaction
+	var tx types.Transaction
+	if err := rlp.DecodeBytes(req.Tx, &tx); err != nil {
+		return &abcitypes.ResponseCheckTx{Code: 2, Log: fmt.Sprintf("invalid rlp: %v", err)}, nil
+	}
+
+	// Optional: Check chainID if available in config, or other basic checks.
+	// For now, just ensuring it decodes is a huge step up from accepting random bytes.
+
 	return &abcitypes.ResponseCheckTx{Code: abcitypes.CodeTypeOK}, nil
 }
 

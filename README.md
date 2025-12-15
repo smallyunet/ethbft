@@ -2,21 +2,20 @@
 
 EthBFT is an experimental, lightweight bridge that drives an Ethereum Execution Layer (EL) client (e.g. Geth) using CometBFT block heights as a timing/advancement signal. It focuses on the **Engine API orchestration loop** (forkchoice + payload production) rather than full state / transaction integration. For every new CometBFT height, EthBFT requests the EL to build (currently empty) blocks and advances forkchoice accordingly.
 
-> Status: Proof‑of‑concept / demo. ABCI logic is minimal, blocks produced by Geth are empty, and no transaction translation is performed yet. Expect breaking changes.
+> Status: Proof‑of‑concept / demo. ABCI logic includes basic transaction validation. Blocks produced by Geth include transactions injected from CometBFT. Expect breaking changes.
 
 ## 🚀 Features (Current Scope)
 
 - **Engine API Loop**: Implements the minimal sequence: forkchoiceUpdated → getPayload → newPayload → forkchoiceUpdated (final) per CometBFT height.
-- **Height Tracking**: Maintains mapping of CometBFT height → EL head hash to choose parents.
-- **ABCI Skeleton**: Implements required ABCI methods with no transaction execution (returns OK for all txs).
+- **Height Tracking**: Maintains mapping of CometBFT height → EL head hash to choose parents. Persisted to disk (`ethbft_state.json`).
+- **ABCI Integration**: Implements ABCI methods with transaction validation (RLP decoding) and injection into Geth.
 - **Dynamic Parent Selection**: Falls back to EL latest head or genesis if internal map has no parent yet.
 - **JWT (HS256) Auth**: Automatically signs Engine API calls when a JWT secret is provided.
-- **Health Endpoint**: HTTP `/health` (port 8081) plus ABCI socket (8080).
+- **Health & Metrics**: HTTP `/health` (port 8081), Prometheus metrics, plus ABCI socket (8080).
 - **Docker Stack**: One‑command demo bringing up Geth + EthBFT + CometBFT.
-- **Config Flag**: `bridge.enableBridging` toggles the block production loop.
+- **Configurable**: Supports `feeRecipient` and bridging toggle.
 
 ### Not (Yet) Implemented
-- Transaction ingestion / translation between CometBFT and EL
 - Execution payload construction from CometBFT data (legacy helpers retained but unused)
 - Safe / finalized head derivation beyond setting all three to the produced head
 - State proofs, validator set management, or multi‑node orchestration

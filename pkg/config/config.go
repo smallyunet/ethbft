@@ -30,6 +30,7 @@ type Config struct {
 		LogLevel       string `yaml:"logLevel"`       // Log level (debug, info, warn, error)
 		EnableBridging bool   `yaml:"enableBridging"` // Whether to enable actual CometBFT->Geth bridging
 		Timeout        int    `yaml:"timeout"`        // Global timeout in seconds for operations
+		FeeRecipient   string `yaml:"feeRecipient"`   // Address to receive block rewards
 	} `yaml:"bridge"`
 }
 

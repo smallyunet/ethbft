@@ -11,3 +11,4 @@ bridge:
   listenAddr: "0.0.0.0:8080"
   logLevel: "info"
   enableBridging: true
+  feeRecipient: "0x0000000000000000000000000000000000000000" # Change this to your address

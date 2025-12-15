@@ -8,9 +8,12 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"os"
+	"sort"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/smallyunet/ethbft/pkg/config"
 	"github.com/smallyunet/ethbft/pkg/consensus"
@@ -100,6 +103,8 @@ func NewBridge(cfg *config.Config) (*Bridge, error) {
 		maxHistory:   4096,
 		logger:       logger,
 	}
+
+	b.loadState()
 
 	b.abciApp = NewABCIApplication(b)
 	b.abciServer = NewABCIServer(b)
@@ -344,7 +349,15 @@ func (b *Bridge) getBlockTimestampByHash(ctx context.Context, h common.Hash) uin
 // 2) engine_getPayloadV2(payloadId) -> payload built by Geth
 // 3) engine_newPayloadV2(payload) -> VALID/ACCEPTED
 // 4) engine_forkchoiceUpdatedV2(state=head=headOfPayload, safe=head, finalized=head)
-func (b *Bridge) produceBlockAtHeight(height int64) error {
+func (b *Bridge) produceBlockAtHeight(height int64) (err error) {
+	timer := prometheus.NewTimer(blockProductionDuration)
+	defer timer.ObserveDuration()
+	defer func() {
+		if err != nil {
+			rpcErrors.Inc()
+		}
+	}()
+
 	// 0) Inject transactions from TxPool into Geth Mempool
 	txs := b.txPool.GetTxs(height)
 	timeout := 8 * time.Second
@@ -409,10 +422,14 @@ func (b *Bridge) produceBlockAtHeight(height int64) error {
 	if parentTs > 0 && ts <= parentTs {
 		ts = parentTs + 1
 	}
+	feeRecipient := common.Address{}
+	if b.config.Bridge.FeeRecipient != "" {
+		feeRecipient = common.HexToAddress(b.config.Bridge.FeeRecipient)
+	}
 	attrs := &PayloadAttributes{
 		Timestamp:             ts,
 		Random:                zeroHash(),       // prevRandao (field name is Random in go-ethereum ExecutableData/Attributes)
-		SuggestedFeeRecipient: common.Address{}, // zero address for demo
+		SuggestedFeeRecipient: feeRecipient,
 	}
 
 	// 4) Forkchoice with attributes to get payloadId.
@@ -496,6 +513,7 @@ func (b *Bridge) produceBlockAtHeight(height int64) error {
 
 	// Track mapping: height -> head hash (used to pick parent next time).
 	b.setHeightHash(height, head)
+	b.saveState()
 	b.logger.Info("Produced block", "height", height, "head", head.Hex(), "txs", len(payload.Transactions))
 	return nil
 }
@@ -552,4 +570,54 @@ func (b *Bridge) sendForkchoiceUpdate(head, safe, finalized common.Hash) error {
 		return fmt.Errorf("forkchoice status=%s validationError=%s", resp.PayloadStatus.Status, resp.PayloadStatus.ValidationError)
 	}
 	return nil
+}
+
+const stateFile = "ethbft_state.json"
+
+func (b *Bridge) saveState() {
+	b.heightMu.RLock()
+	defer b.heightMu.RUnlock()
+
+	if len(b.heightToHash) == 0 {
+		return
+	}
+
+	data, err := json.Marshal(b.heightToHash)
+	if err != nil {
+		b.logger.Error("Failed to marshal state", "error", err)
+		return
+	}
+	if err := os.WriteFile(stateFile, data, 0644); err != nil {
+		b.logger.Error("Failed to write state file", "error", err)
+	}
+}
+
+func (b *Bridge) loadState() {
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			b.logger.Error("Failed to read state file", "error", err)
+		}
+		return
+	}
+
+	var m map[int64]common.Hash
+	if err := json.Unmarshal(data, &m); err != nil {
+		b.logger.Error("Failed to unmarshal state", "error", err)
+		return
+	}
+
+	b.heightMu.Lock()
+	defer b.heightMu.Unlock()
+	b.heightToHash = m
+
+	// Rebuild heightOrder
+	b.heightOrder = make([]int64, 0, len(m))
+	for h := range m {
+		b.heightOrder = append(b.heightOrder, h)
+	}
+	sort.Slice(b.heightOrder, func(i, j int) bool {
+		return b.heightOrder[i] < b.heightOrder[j]
+	})
+	b.logger.Info("Loaded state", "entries", len(m))
 }
