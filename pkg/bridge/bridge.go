@@ -15,6 +15,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/smallyunet/ethbft/pkg/config"
 	"github.com/smallyunet/ethbft/pkg/consensus"
 	"github.com/smallyunet/ethbft/pkg/ethereum"
@@ -430,6 +431,7 @@ func (b *Bridge) produceBlockAtHeight(height int64) (err error) {
 		Timestamp:             ts,
 		Random:                zeroHash(),       // prevRandao (field name is Random in go-ethereum ExecutableData/Attributes)
 		SuggestedFeeRecipient: feeRecipient,
+		Withdrawals:           []*types.Withdrawal{}, // Mandatory for V2 (Shanghai)
 	}
 
 	// 4) Forkchoice with attributes to get payloadId.

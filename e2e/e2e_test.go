@@ -131,8 +131,8 @@ func setupEnvironment(t *testing.T) (string, error) {
     "istanbulBlock": 0,
     "berlinBlock": 0,
     "londonBlock": 0,
-    "mergeForkBlock": 0,
-    "terminalTotalDifficulty": 0
+    "terminalTotalDifficulty": 0,
+    "shanghaiTime": 0
   },
   "alloc": {
     "%s": { "balance": "1000000000000000000000" }
