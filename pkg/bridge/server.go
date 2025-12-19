@@ -54,7 +54,7 @@ func (app *ABCIApplication) Info(ctx context.Context, req *abcitypes.RequestInfo
 	app.logger.Info("ABCI Info", "version", req.Version, "block_version", req.BlockVersion, "p2p_version", req.P2PVersion)
 	return &abcitypes.ResponseInfo{
 		Data:             "ethbft",
-		Version:          "1.0.0",
+		Version:          "0.0.4",
 		AppVersion:       1,
 		LastBlockHeight:  0,
 		LastBlockAppHash: []byte{},
@@ -77,8 +77,15 @@ func (app *ABCIApplication) CheckTx(ctx context.Context, req *abcitypes.RequestC
 		return &abcitypes.ResponseCheckTx{Code: 2, Log: fmt.Sprintf("invalid rlp: %v", err)}, nil
 	}
 
-	// Optional: Check chainID if available in config, or other basic checks.
-	// For now, just ensuring it decodes is a huge step up from accepting random bytes.
+	// Strict ChainID check if we have one
+	if app.bridge.chainID != nil {
+		if tx.ChainId().Cmp(app.bridge.chainID) != 0 {
+			return &abcitypes.ResponseCheckTx{
+				Code: 3,
+				Log:  fmt.Sprintf("wrong chainID: got %v want %v", tx.ChainId(), app.bridge.chainID),
+			}, nil
+		}
+	}
 
 	return &abcitypes.ResponseCheckTx{Code: abcitypes.CodeTypeOK}, nil
 }

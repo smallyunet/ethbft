@@ -5,11 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/big"
+	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
-	"os"
-	"sort"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
@@ -34,6 +35,7 @@ type Bridge struct {
 	abciServer *ABCIServer
 	abciApp    *ABCIApplication
 	txPool     *TxPool
+	chainID    *big.Int
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -103,6 +105,22 @@ func NewBridge(cfg *config.Config) (*Bridge, error) {
 		heightOrder:  make([]int64, 0, 1024),
 		maxHistory:   4096,
 		logger:       logger,
+	}
+
+	// Fetch ChainID from EL
+	{
+		timeout := 5 * time.Second
+		if cfg.Bridge.Timeout > 0 {
+			timeout = time.Duration(cfg.Bridge.Timeout) * time.Second
+		}
+		ctx2, cancel2 := context.WithTimeout(ctx, timeout)
+		defer cancel2()
+		cid, err := ethClient.GetChainID(ctx2)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get chainID: %w", err)
+		}
+		b.chainID = cid
+		b.logger.Info("Connected to Ethereum", "chainID", cid.String())
 	}
 
 	b.loadState()
@@ -429,7 +447,7 @@ func (b *Bridge) produceBlockAtHeight(height int64) (err error) {
 	}
 	attrs := &PayloadAttributes{
 		Timestamp:             ts,
-		Random:                zeroHash(),       // prevRandao (field name is Random in go-ethereum ExecutableData/Attributes)
+		Random:                zeroHash(), // prevRandao (field name is Random in go-ethereum ExecutableData/Attributes)
 		SuggestedFeeRecipient: feeRecipient,
 		Withdrawals:           []*types.Withdrawal{}, // Mandatory for V2 (Shanghai)
 	}
@@ -437,13 +455,30 @@ func (b *Bridge) produceBlockAtHeight(height int64) (err error) {
 	// 4) Forkchoice with attributes to get payloadId.
 	ctx, cancel := context.WithTimeout(b.ctx, timeout)
 	defer cancel()
+
+	// Calculate Safe/Finalized based on depth
+	safeHash := parent
+	finalizedHash := parent
+	depth := b.config.Bridge.FinalityDepth
+	if depth > 0 && height > int64(depth) {
+		h := b.getHeightHash(height - int64(depth))
+		if (h != common.Hash{}) {
+			finalizedHash = h
+			safeHash = h // Simplification: safe = finalized for now
+		} else if b.elGenesis != (common.Hash{}) {
+			// Fallback to genesis if history lost
+			finalizedHash = b.elGenesis
+			safeHash = b.elGenesis
+		}
+	}
+
 	type fcuReq struct {
 		Head      common.Hash `json:"headBlockHash"`
 		Safe      common.Hash `json:"safeBlockHash"`
 		Finalized common.Hash `json:"finalizedBlockHash"`
 	}
 	req := []any{
-		&fcuReq{Head: parent, Safe: parent, Finalized: parent},
+		&fcuReq{Head: parent, Safe: safeHash, Finalized: finalizedHash},
 		attrs,
 	}
 	// b.logger.Debug("engine_forkchoiceUpdatedV2.req", "req", req)
@@ -507,9 +542,39 @@ func (b *Bridge) produceBlockAtHeight(height int64) (err error) {
 		return fmt.Errorf("newPayloadV2 status=%s err=%s", np.Status, np.ValidationError)
 	}
 
-	// 7) Final forkchoice: set head/safe/finalized to payload block hash for the demo.
+	// 7) Final forkchoice: set head/safe/finalized
+	// Safe/Finalized should remain as calculated before (based on depth from NEW head, effectively same or +1 if we want to be precise,
+	// but usually finalized doesn't move immediately with head unless depth=0).
+	// If depth=0, then head=safe=finalized (which is what we had).
+	// If depth>0, we keep the previous finalized/safe or update them if this new block pushes them forward.
+	// For simplicity, let's recalculate based on new height (height).
+
+	// The 'height' param to this function is the one we just produced (payload.BlockHash).
+	// So if depth=0, finalized=head.
+
 	head := payload.BlockHash
-	if err := b.sendForkchoiceUpdate(head, head, head); err != nil {
+	newSafe := head
+	newFinalized := head
+	if depth > 0 {
+		// Current height is 'height'. Finalized is at 'height - depth'.
+		// We haven't stored 'head' into heightToHash yet (step 8 is next), so we can't look it up by GetHeightHash(height).
+		// But we know 'head' IS the hash for 'height'.
+
+		finalizedHeight := height - int64(depth)
+		if finalizedHeight == height {
+			newFinalized = head
+		} else {
+			h := b.getHeightHash(finalizedHeight)
+			if (h != common.Hash{}) {
+				newFinalized = h
+			} else if b.elGenesis != (common.Hash{}) {
+				newFinalized = b.elGenesis
+			}
+		}
+		newSafe = newFinalized
+	}
+
+	if err := b.sendForkchoiceUpdate(head, newSafe, newFinalized); err != nil {
 		return fmt.Errorf("final fcu failed: %w", err)
 	}
 

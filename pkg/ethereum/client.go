@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"os"
 	"strings"
@@ -216,4 +217,21 @@ func (c *Client) generateJWT() (string, error) {
 	sigEnc := enc(sig)
 
 	return signingInput + "." + sigEnc, nil
+}
+
+// GetChainID fetches the chain ID from the Ethereum client
+func (c *Client) GetChainID(ctx context.Context) (*big.Int, error) {
+	res, err := c.Call(ctx, "eth_chainId", []interface{}{})
+	if err != nil {
+		return nil, err
+	}
+	var chainIDHex string
+	if err := json.Unmarshal(res, &chainIDHex); err != nil {
+		return nil, fmt.Errorf("decode chainId: %w", err)
+	}
+	chainID := new(big.Int)
+	if _, ok := chainID.SetString(strings.TrimPrefix(chainIDHex, "0x"), 16); !ok {
+		return nil, fmt.Errorf("invalid chainId hex: %s", chainIDHex)
+	}
+	return chainID, nil
 }

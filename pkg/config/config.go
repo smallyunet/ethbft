@@ -31,6 +31,7 @@ type Config struct {
 		EnableBridging bool   `yaml:"enableBridging"` // Whether to enable actual CometBFT->Geth bridging
 		Timeout        int    `yaml:"timeout"`        // Global timeout in seconds for operations
 		FeeRecipient   string `yaml:"feeRecipient"`   // Address to receive block rewards
+		FinalityDepth  int    `yaml:"finalityDepth"`  // Number of blocks behind head for safe/finalized
 	} `yaml:"bridge"`
 }
 
@@ -52,6 +53,7 @@ func DefaultConfig() *Config {
 	cfg.Bridge.LogLevel = "info"
 	cfg.Bridge.EnableBridging = true // Default to enabled for actual bridging
 	cfg.Bridge.Timeout = 10          // Default 10s timeout
+	cfg.Bridge.FinalityDepth = 0     // Default to 0 (finalize immediately for demo)
 
 	return cfg
 }
@@ -107,7 +109,7 @@ func replaceHost(rawURL, newHost string) string {
 		// Fallback to simple replacement if parsing fails
 		return strings.Replace(rawURL, "localhost", newHost, 1)
 	}
-	
+
 	// Handle host with port
 	host := u.Host
 	port := ""
@@ -118,7 +120,7 @@ func replaceHost(rawURL, newHost string) string {
 			port = ":" + parts[1]
 		}
 	}
-	
+
 	u.Host = newHost + port
 	return u.String()
 }
