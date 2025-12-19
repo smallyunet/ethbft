@@ -12,5 +12,6 @@ services:
       - ./e2e/data/cometbft:/cometbft
 
   cometbft:
+    user: "0:0"  # Run as root to avoid permission issues in CI
     volumes:
       - ./e2e/data/cometbft:/cometbft

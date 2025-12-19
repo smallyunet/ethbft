@@ -1,7 +1,9 @@
 #!/bin/sh
 set -e
 
-mkdir -p /cometbft/config /cometbft/data
+# Try to create directories if they don't exist
+# In CI, these might already exist or we might not have permissions
+mkdir -p /cometbft/config /cometbft/data 2>/dev/null || true
 
 if [ ! -f /cometbft/config/genesis.json ] || \
   [ ! -f /cometbft/config/config.toml ] || \
