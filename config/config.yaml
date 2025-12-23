@@ -9,6 +9,9 @@ cometbft:
 
 bridge:
   listenAddr: "0.0.0.0:8080"
+  healthAddr: "0.0.0.0:8081"
+  stateFile: "ethbft_state.json"
+  appVersion: "0.0.5"
   logLevel: "info"
   enableBridging: true
   feeRecipient: "0x0000000000000000000000000000000000000000" # Change this to your address

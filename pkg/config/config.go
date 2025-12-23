@@ -32,6 +32,9 @@ type Config struct {
 		Timeout        int    `yaml:"timeout"`        // Global timeout in seconds for operations
 		FeeRecipient   string `yaml:"feeRecipient"`   // Address to receive block rewards
 		FinalityDepth  int    `yaml:"finalityDepth"`  // Number of blocks behind head for safe/finalized
+		StateFile      string `yaml:"stateFile"`      // Path to state persistence file
+		HealthAddr     string `yaml:"healthAddr"`     // Address for health/metrics server
+		AppVersion     string `yaml:"appVersion"`     // Application version reported to ABCI
 	} `yaml:"bridge"`
 }
 
@@ -54,6 +57,9 @@ func DefaultConfig() *Config {
 	cfg.Bridge.EnableBridging = true // Default to enabled for actual bridging
 	cfg.Bridge.Timeout = 10          // Default 10s timeout
 	cfg.Bridge.FinalityDepth = 0     // Default to 0 (finalize immediately for demo)
+	cfg.Bridge.StateFile = "ethbft_state.json"
+	cfg.Bridge.HealthAddr = "0.0.0.0:8081"
+	cfg.Bridge.AppVersion = "0.0.5" // Bump version to reflect fixes
 
 	return cfg
 }

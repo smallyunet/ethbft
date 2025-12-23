@@ -51,10 +51,14 @@ func NewABCIApplication(bridge *Bridge) *ABCIApplication {
 }
 
 func (app *ABCIApplication) Info(ctx context.Context, req *abcitypes.RequestInfo) (*abcitypes.ResponseInfo, error) {
-	app.logger.Info("ABCI Info", "version", req.Version, "block_version", req.BlockVersion, "p2p_version", req.P2PVersion)
+	version := "0.0.5"
+	if app.bridge.config != nil && app.bridge.config.Bridge.AppVersion != "" {
+		version = app.bridge.config.Bridge.AppVersion
+	}
+	app.logger.Info("ABCI Info", "version", req.Version, "app_version", version)
 	return &abcitypes.ResponseInfo{
 		Data:             "ethbft",
-		Version:          "0.0.4",
+		Version:          version,
 		AppVersion:       1,
 		LastBlockHeight:  0,
 		LastBlockAppHash: []byte{},
@@ -77,14 +81,19 @@ func (app *ABCIApplication) CheckTx(ctx context.Context, req *abcitypes.RequestC
 		return &abcitypes.ResponseCheckTx{Code: 2, Log: fmt.Sprintf("invalid rlp: %v", err)}, nil
 	}
 
-	// Strict ChainID check if we have one
-	if app.bridge.chainID != nil {
-		if tx.ChainId().Cmp(app.bridge.chainID) != 0 {
-			return &abcitypes.ResponseCheckTx{
-				Code: 3,
-				Log:  fmt.Sprintf("wrong chainID: got %v want %v", tx.ChainId(), app.bridge.chainID),
-			}, nil
-		}
+	// Strict ChainID check
+	if app.bridge.chainID == nil {
+		return &abcitypes.ResponseCheckTx{
+			Code: 4,
+			Log:  "bridge not initialized: chainID unknown",
+		}, nil
+	}
+
+	if tx.ChainId().Cmp(app.bridge.chainID) != 0 {
+		return &abcitypes.ResponseCheckTx{
+			Code: 3,
+			Log:  fmt.Sprintf("wrong chainID: got %v want %v", tx.ChainId(), app.bridge.chainID),
+		}, nil
 	}
 
 	return &abcitypes.ResponseCheckTx{Code: abcitypes.CodeTypeOK}, nil
@@ -164,8 +173,13 @@ type ABCIServer struct {
 func NewABCIServer(bridge *Bridge) *ABCIServer {
 	addr := "0.0.0.0:8080"
 	health := "0.0.0.0:8081"
-	if bridge.config != nil && bridge.config.Bridge.ListenAddr != "" {
-		addr = bridge.config.Bridge.ListenAddr
+	if bridge.config != nil {
+		if bridge.config.Bridge.ListenAddr != "" {
+			addr = bridge.config.Bridge.ListenAddr
+		}
+		if bridge.config.Bridge.HealthAddr != "" {
+			health = bridge.config.Bridge.HealthAddr
+		}
 	}
 	return &ABCIServer{
 		bridge:     bridge,
