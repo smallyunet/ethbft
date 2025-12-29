@@ -19,8 +19,8 @@ type FCURequest struct {
 }
 
 type FCUResponse struct {
-	PayloadStatus PayloadStatus `json:"payloadStatus"`
-	PayloadID     hexutil.Bytes `json:"payloadId"`
+	PayloadStatus PayloadStatus  `json:"payloadStatus"`
+	PayloadID     *hexutil.Bytes `json:"payloadId"`
 }
 
 type PayloadStatus struct {

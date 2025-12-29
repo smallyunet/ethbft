@@ -197,7 +197,7 @@ func (b *Bridge) produceBlockAtHeight(height int64) (err error) {
 	if err := json.Unmarshal(raw, &fcuResp); err != nil {
 		return fmt.Errorf("decode fcu resp: %w", err)
 	}
-	if len(fcuResp.PayloadID) == 0 {
+	if fcuResp.PayloadID == nil {
 		if fcuResp.PayloadStatus.Status == "SYNCING" {
 			return fmt.Errorf("engine is SYNCING, cannot produce payload")
 		}
@@ -206,7 +206,7 @@ func (b *Bridge) produceBlockAtHeight(height int64) (err error) {
 		if err != nil {
 			return fmt.Errorf("fcu retry call: %w", err)
 		}
-		if err := json.Unmarshal(rawRetry, &fcuResp); err != nil || len(fcuResp.PayloadID) == 0 {
+		if err := json.Unmarshal(rawRetry, &fcuResp); err != nil || fcuResp.PayloadID == nil {
 			return fmt.Errorf("no payloadId from fcu, status=%s err=%s",
 				fcuResp.PayloadStatus.Status, fcuResp.PayloadStatus.ValidationError)
 		}
