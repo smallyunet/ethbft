@@ -35,6 +35,14 @@ var (
 		Help:    "Time taken to produce a block via Engine API",
 		Buckets: prometheus.DefBuckets,
 	})
+	txsRejected = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "ethbft_txs_rejected_total",
+		Help: "Total number of transactions rejected by ABCI CheckTx",
+	})
+	txsInjectionFailed = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "ethbft_txs_injection_failed_total",
+		Help: "Total number of transactions that failed injection into Geth",
+	})
 )
 
 // ABCIApplication implements minimal CometBFT ABCI to drive heights.
@@ -78,11 +86,13 @@ func (app *ABCIApplication) CheckTx(ctx context.Context, req *abcitypes.RequestC
 	// Decode transaction to ensure it is a valid Ethereum transaction
 	var tx types.Transaction
 	if err := rlp.DecodeBytes(req.Tx, &tx); err != nil {
+		txsRejected.Inc()
 		return &abcitypes.ResponseCheckTx{Code: 2, Log: fmt.Sprintf("invalid rlp: %v", err)}, nil
 	}
 
 	// Strict ChainID check
 	if app.bridge.chainID == nil {
+		txsRejected.Inc()
 		return &abcitypes.ResponseCheckTx{
 			Code: 4,
 			Log:  "bridge not initialized: chainID unknown",
@@ -90,9 +100,20 @@ func (app *ABCIApplication) CheckTx(ctx context.Context, req *abcitypes.RequestC
 	}
 
 	if tx.ChainId().Cmp(app.bridge.chainID) != 0 {
+		txsRejected.Inc()
 		return &abcitypes.ResponseCheckTx{
 			Code: 3,
 			Log:  fmt.Sprintf("wrong chainID: got %v want %v", tx.ChainId(), app.bridge.chainID),
+		}, nil
+	}
+
+	// Verify signature
+	signer := types.LatestSignerForChainID(app.bridge.chainID)
+	if _, err := types.Sender(signer, &tx); err != nil {
+		txsRejected.Inc()
+		return &abcitypes.ResponseCheckTx{
+			Code: 5,
+			Log:  fmt.Sprintf("invalid signature: %v", err),
 		}, nil
 	}
 

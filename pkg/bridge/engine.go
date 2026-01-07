@@ -112,6 +112,7 @@ func (b *Bridge) produceBlockAtHeight(height int64) (err error) {
 				_, err := b.ethClient.Call(ctxTx, "eth_sendRawTransaction", []interface{}{txHex})
 				if err != nil {
 					b.logger.Warn("Failed to inject tx", "error", err)
+					txsInjectionFailed.Inc()
 				}
 			}(tx)
 		}
