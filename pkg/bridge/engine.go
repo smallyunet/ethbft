@@ -270,11 +270,11 @@ func (b *Bridge) produceBlockAtHeight(height int64) (err error) {
 
 	// 7) Final forkchoice
 	head := payload.BlockHash
-	newSafe = head
-	newFinalized = head
+	newSafe := head
+	newFinalized := head
 
 	// Calculate safe hash
-	safeDepth := b.config.Bridge.SafeDepth
+	safeDepth = b.config.Bridge.SafeDepth
 	// Backward compatibility: if not set, check old FinalityDepth
 	if safeDepth == 0 && b.config.Bridge.FinalityDepth > 0 {
 		safeDepth = b.config.Bridge.FinalityDepth
@@ -295,7 +295,7 @@ func (b *Bridge) produceBlockAtHeight(height int64) (err error) {
 	}
 
 	// Calculate finalized hash
-	finalizedDepth := b.config.Bridge.FinalizedDepth
+	finalizedDepth = b.config.Bridge.FinalizedDepth
 	// Backward compatibility
 	if finalizedDepth == 0 && b.config.Bridge.FinalityDepth > 0 {
 		finalizedDepth = b.config.Bridge.FinalityDepth
