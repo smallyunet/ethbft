@@ -10,9 +10,9 @@ EthBFT is an experimental, lightweight bridge that drives an Ethereum Execution 
 - **Height Tracking**: Maintains mapping of CometBFT height → EL head hash to choose parents. Persisted to disk (`ethbft_state.json`).
 - **ABCI Integration**: Implements ABCI methods with transaction validation (RLP decoding & ChainID check) and injection into Geth.
 - **Dynamic Parent Selection**: Falls back to EL latest head or genesis if internal map has no parent yet.
-- **Finality Lag**: Configurable `finalityDepth` to delay safe/finalized head updates relative to current head.
+- **Flexible Finality**: Configurable `safeDepth` and `finalizedDepth` to control safe/finalized head lag relative to current head.
 - **JWT (HS256) Auth**: Automatically signs Engine API calls when a JWT secret is provided.
-- **Health & Metrics**: HTTP `/health` (port 8081), Prometheus metrics, plus ABCI socket (8080).
+- **Improved Health Check**: HTTP `/health` (port 8081) checks Geth and CometBFT connectivity, plus ABCI socket (8080).
 - **Docker Stack**: One‑command demo bringing up Geth + EthBFT + CometBFT.
 - **Configurable**: Supports `feeRecipient` and bridging toggle.
 
@@ -146,6 +146,8 @@ bridge:
   listenAddr: "0.0.0.0:8080"            # ABCI socket address
   logLevel: "info"
   enableBridging: true                   # If false: ABCI server only, no EL block production
+  safeDepth: 4                           # Number of blocks behind head for safe
+  finalizedDepth: 32                     # Number of blocks behind head for finalized
 ```
 
 ### Environment Variables

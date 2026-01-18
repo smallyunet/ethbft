@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -59,7 +60,7 @@ func NewABCIApplication(bridge *Bridge) *ABCIApplication {
 }
 
 func (app *ABCIApplication) Info(ctx context.Context, req *abcitypes.RequestInfo) (*abcitypes.ResponseInfo, error) {
-	version := "0.0.5"
+	version := "0.0.7"
 	if app.bridge.config != nil && app.bridge.config.Bridge.AppVersion != "" {
 		version = app.bridge.config.Bridge.AppVersion
 	}
@@ -224,8 +225,50 @@ func (s *ABCIServer) Start() error {
 	// Health HTTP server
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("OK"))
+		status := http.StatusOK
+		response := make(map[string]any)
+		response["status"] = "ok"
+
+		// Check Geth
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if _, err := s.bridge.ethClient.Call(ctx, "eth_blockNumber", nil); err != nil {
+			status = http.StatusServiceUnavailable
+			response["status"] = "error"
+			response["ethereum_error"] = err.Error()
+		} else {
+			response["ethereum"] = "connected"
+		}
+
+		// Check CometBFT
+		ctxCons, cancelCons := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancelCons()
+		if status == http.StatusOK { // Only check if still OK or if we want full report? Let's check all.
+			// Re-use status if already error
+		}
+		if _, err := s.bridge.consClient.GetStatus(ctxCons); err != nil {
+			status = http.StatusServiceUnavailable
+			response["status"] = "error"
+			response["cometbft_error"] = err.Error()
+		} else {
+			response["cometbft"] = "connected"
+		}
+
+		// Also check bridge running state
+		s.bridge.runningLock.Lock()
+		running := s.bridge.running
+		s.bridge.runningLock.Unlock()
+		if !running {
+			status = http.StatusServiceUnavailable
+			response["status"] = "error"
+			response["bridge_running"] = false
+		} else {
+			response["bridge_running"] = true
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(response)
 	})
 	mux.Handle("/metrics", promhttp.Handler())
 

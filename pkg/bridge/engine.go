@@ -174,15 +174,36 @@ func (b *Bridge) produceBlockAtHeight(height int64) (err error) {
 
 	safeHash := parent
 	finalizedHash := parent
-	depth := b.config.Bridge.FinalityDepth
-	if depth > 0 && height > int64(depth) {
-		h := b.getHeightHash(height - int64(depth))
+
+	// Calculate safe hash
+	safeDepth := b.config.Bridge.SafeDepth
+	// Backward compatibility: if not set, check old FinalityDepth
+	if safeDepth == 0 && b.config.Bridge.FinalityDepth > 0 {
+		safeDepth = b.config.Bridge.FinalityDepth
+	}
+
+	if safeDepth > 0 && height > int64(safeDepth) {
+		h := b.getHeightHash(height - int64(safeDepth))
 		if (h != common.Hash{}) {
-			finalizedHash = h
 			safeHash = h
 		} else if b.elGenesis != (common.Hash{}) {
-			finalizedHash = b.elGenesis
 			safeHash = b.elGenesis
+		}
+	}
+
+	// Calculate finalized hash
+	finalizedDepth := b.config.Bridge.FinalizedDepth
+	// Backward compatibility
+	if finalizedDepth == 0 && b.config.Bridge.FinalityDepth > 0 {
+		finalizedDepth = b.config.Bridge.FinalityDepth
+	}
+
+	if finalizedDepth > 0 && height > int64(finalizedDepth) {
+		h := b.getHeightHash(height - int64(finalizedDepth))
+		if (h != common.Hash{}) {
+			finalizedHash = h
+		} else if b.elGenesis != (common.Hash{}) {
+			finalizedHash = b.elGenesis
 		}
 	}
 
@@ -249,10 +270,39 @@ func (b *Bridge) produceBlockAtHeight(height int64) (err error) {
 
 	// 7) Final forkchoice
 	head := payload.BlockHash
-	newSafe := head
-	newFinalized := head
-	if depth > 0 {
-		finalizedHeight := height - int64(depth)
+	newSafe = head
+	newFinalized = head
+
+	// Calculate safe hash
+	safeDepth := b.config.Bridge.SafeDepth
+	// Backward compatibility: if not set, check old FinalityDepth
+	if safeDepth == 0 && b.config.Bridge.FinalityDepth > 0 {
+		safeDepth = b.config.Bridge.FinalityDepth
+	}
+
+	if safeDepth > 0 {
+		safeHeight := height - int64(safeDepth)
+		if safeHeight == height {
+			newSafe = head
+		} else {
+			h := b.getHeightHash(safeHeight)
+			if (h != common.Hash{}) {
+				newSafe = h
+			} else if b.elGenesis != (common.Hash{}) {
+				newSafe = b.elGenesis
+			}
+		}
+	}
+
+	// Calculate finalized hash
+	finalizedDepth := b.config.Bridge.FinalizedDepth
+	// Backward compatibility
+	if finalizedDepth == 0 && b.config.Bridge.FinalityDepth > 0 {
+		finalizedDepth = b.config.Bridge.FinalityDepth
+	}
+
+	if finalizedDepth > 0 {
+		finalizedHeight := height - int64(finalizedDepth)
 		if finalizedHeight == height {
 			newFinalized = head
 		} else {
@@ -263,7 +313,6 @@ func (b *Bridge) produceBlockAtHeight(height int64) (err error) {
 				newFinalized = b.elGenesis
 			}
 		}
-		newSafe = newFinalized
 	}
 
 	if err := b.sendForkchoiceUpdate(head, newSafe, newFinalized); err != nil {
