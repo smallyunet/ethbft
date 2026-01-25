@@ -273,6 +273,28 @@ func (b *Bridge) produceBlockAtHeight(height int64) (err error) {
 	newSafe := head
 	newFinalized := head
 
+	// Check for transaction inclusion
+	includedTxs := len(payload.Transactions)
+	expectedTxs := len(txs)
+	if expectedTxs > 0 {
+		// Basic count check (since we don't easily have hash of EL txs here without decoding 
+		// the payload txs, which is expensive, but for v0.0.8 this is a good start)
+		if includedTxs < expectedTxs {
+			b.logger.Warn("Transactions missing from block", 
+				"height", height, 
+				"expected", expectedTxs, 
+				"included", includedTxs, 
+				"missing_count", expectedTxs-includedTxs)
+		} else {
+			b.logger.Info("Block produced with expected transactions",
+				"height", height,
+				"expected", expectedTxs,
+				"included", includedTxs)
+		}
+	} else {
+		b.logger.Info("Produced block", "height", height, "head", head.Hex(), "txs", includedTxs)
+	}
+
 	// Calculate safe hash
 	safeDepth = b.config.Bridge.SafeDepth
 	// Backward compatibility: if not set, check old FinalityDepth
@@ -321,7 +343,6 @@ func (b *Bridge) produceBlockAtHeight(height int64) (err error) {
 
 	b.setHeightHash(height, head)
 	b.saveState()
-	b.logger.Info("Produced block", "height", height, "head", head.Hex(), "txs", len(payload.Transactions))
 	return nil
 }
 

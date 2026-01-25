@@ -60,7 +60,7 @@ func NewABCIApplication(bridge *Bridge) *ABCIApplication {
 }
 
 func (app *ABCIApplication) Info(ctx context.Context, req *abcitypes.RequestInfo) (*abcitypes.ResponseInfo, error) {
-	version := "0.0.7"
+	version := "0.0.8"
 	if app.bridge.config != nil && app.bridge.config.Bridge.AppVersion != "" {
 		version = app.bridge.config.Bridge.AppVersion
 	}

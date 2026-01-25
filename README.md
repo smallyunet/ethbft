@@ -13,12 +13,12 @@ EthBFT is an experimental, lightweight bridge that drives an Ethereum Execution 
 - **Flexible Finality**: Configurable `safeDepth` and `finalizedDepth` to control safe/finalized head lag relative to current head.
 - **JWT (HS256) Auth**: Automatically signs Engine API calls when a JWT secret is provided.
 - **Improved Health Check**: HTTP `/health` (port 8081) checks Geth and CometBFT connectivity, plus ABCI socket (8080).
+- **Metrics & Monitoring**: Prometheus metrics endpoint (`/metrics`) and structured JSON logging.
 - **Docker Stack**: One‑command demo bringing up Geth + EthBFT + CometBFT.
 - **Configurable**: Supports `feeRecipient` and bridging toggle.
 
 ### Not (Yet) Implemented
 - Execution payload construction from CometBFT data (legacy helpers retained but unused)
-- Safe / finalized head derivation beyond setting all three to the produced head
 - State proofs, validator set management, or multi‑node orchestration
 
 ## 📁 Project Structure
@@ -344,9 +344,7 @@ Contributions are welcome! Please feel free to submit issues and pull requests.
 
 ### Future Work (Roadmap Ideas)
 - Map CometBFT transactions into valid Ethereum transactions (RLP encoded) & submit via payload attributes.
-- Derive safe/finalized heads using height windows instead of equating all to head.
 - Multi‑node coordination / validator set syncing.
-- Metrics endpoint (Prometheus) and structured logging.
 - Pluggable transaction pool abstraction.
 
 Feedback & PRs welcome.
