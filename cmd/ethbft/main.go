@@ -3,8 +3,10 @@ package main
 import (
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/smallyunet/ethbft/pkg/bridge"
@@ -19,6 +21,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
+	configureLogging(cfg.Bridge.LogLevel)
 
 	// Create and start the bridge
 	b, err := bridge.NewBridge(cfg)
@@ -37,4 +40,17 @@ func main() {
 	<-sigCh
 
 	fmt.Println("Shutting down EthBFT...")
+}
+
+func configureLogging(levelText string) {
+	level := slog.LevelInfo
+	switch strings.ToLower(levelText) {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})))
 }

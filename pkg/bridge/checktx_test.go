@@ -2,127 +2,114 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"math/big"
-	"path/filepath"
 	"testing"
+	"time"
 
 	abcitypes "github.com/cometbft/cometbft/abci/types"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/rlp"
-	"github.com/smallyunet/ethbft/pkg/config"
+	"github.com/smallyunet/ethbft/pkg/protocol"
 )
 
-func TestCheckTx(t *testing.T) {
-	// Setup
-	chainID := big.NewInt(1337)
-	b := &Bridge{
-		chainID: chainID,
-		config:  &config.Config{},
-		txPool:  NewTxPool(),
-	}
-	b.config.Bridge.StateFile = filepath.Join(t.TempDir(), "state.json")
+func TestCheckTxAdmissionRules(t *testing.T) {
+	b := newTestBridge(t, func(context.Context, string, interface{}) (json.RawMessage, error) {
+		return nil, fmt.Errorf("unexpected engine call")
+	})
 	app := NewABCIApplication(b)
-
-	// Helper to create signed tx
-	key, _ := crypto.GenerateKey()
-
-	createTx := func(nonce uint64, cid *big.Int, sign bool) []byte {
-		txData := &types.LegacyTx{
-			Nonce:    nonce,
-			GasPrice: big.NewInt(100),
-			Gas:      21000,
-			To:       &common.Address{},
-			Value:    big.NewInt(1),
-			Data:     nil,
-		}
-		tx := types.NewTx(txData)
-		if sign {
-			signer := types.LatestSignerForChainID(cid)
-			var err error
-			tx, err = types.SignTx(tx, signer, key)
-			if err != nil {
-				t.Fatalf("failed to sign tx: %v", err)
-			}
-		}
-		out, _ := rlp.EncodeToBytes(tx)
-		return out
+	valid := signedTransactionBytes(t, 0)
+	response, err := app.CheckTx(context.Background(), &abcitypes.RequestCheckTx{Tx: valid})
+	if err != nil || response.Code != abcitypes.CodeTypeOK {
+		t.Fatalf("valid transaction rejected: response=%+v error=%v", response, err)
 	}
 
-	t.Run("Valid Transaction", func(t *testing.T) {
-		txBytes := createTx(0, chainID, true)
-		resp, _ := app.CheckTx(context.Background(), &abcitypes.RequestCheckTx{Tx: txBytes})
-		if resp.Code != abcitypes.CodeTypeOK {
-			t.Fatalf("expected OK, got code %d log %s", resp.Code, resp.Log)
-		}
-	})
+	response, _ = app.CheckTx(context.Background(), &abcitypes.RequestCheckTx{Tx: []byte("invalid")})
+	if response.Code == abcitypes.CodeTypeOK {
+		t.Fatal("invalid encoding accepted")
+	}
+	response, _ = app.CheckTx(context.Background(), &abcitypes.RequestCheckTx{Tx: append(append([]byte(nil), protocol.EnvelopePrefix...), 1)})
+	if response.Code != 6 {
+		t.Fatalf("reserved envelope returned code %d", response.Code)
+	}
 
-	t.Run("Invalid ChainID", func(t *testing.T) {
-		txBytes := createTx(1, big.NewInt(9999), true)
-		resp, _ := app.CheckTx(context.Background(), &abcitypes.RequestCheckTx{Tx: txBytes})
-		if resp.Code != 3 { // Code 3 is wrong chainID
-			t.Fatalf("expected code 3, got code %d log %s", resp.Code, resp.Log)
-		}
-	})
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := types.NewTx(&types.LegacyTx{GasPrice: big.NewInt(1), Gas: 21_000, To: &common.Address{1}})
+	wrongChain, err := types.SignTx(tx, types.LatestSignerForChainID(big.NewInt(9999)), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := wrongChain.MarshalBinary()
+	response, _ = app.CheckTx(context.Background(), &abcitypes.RequestCheckTx{Tx: raw})
+	if response.Code != 3 {
+		t.Fatalf("wrong-chain transaction returned code %d", response.Code)
+	}
+}
 
-	t.Run("Invalid RLP", func(t *testing.T) {
-		txBytes := []byte("invalid-garbage")
-		resp, _ := app.CheckTx(context.Background(), &abcitypes.RequestCheckTx{Tx: txBytes})
-		if resp.Code != 2 { // Code 2 is invalid rlp
-			t.Fatalf("expected code 2, got code %d log %s", resp.Code, resp.Log)
+func TestABCIExecutionProposalLifecycle(t *testing.T) {
+	b := newTestBridge(t, func(_ context.Context, method string, _ interface{}) (json.RawMessage, error) {
+		switch method {
+		case "engine_newPayloadV2":
+			return json.RawMessage(`{"status":"VALID"}`), nil
+		case "engine_forkchoiceUpdatedV2":
+			return json.RawMessage(`{"payloadStatus":{"status":"VALID"},"payloadId":null}`), nil
+		default:
+			return nil, fmt.Errorf("unexpected method %s", method)
 		}
 	})
+	app := NewABCIApplication(b)
+	proposalTime := time.Unix(1_800_000_000, 0).UTC()
+	proposal, payload := testProposal(t, b, 1, proposalTime, [][]byte{signedTransactionBytes(t, 0)})
 
-	t.Run("ProcessProposal Rejects Invalid Transaction", func(t *testing.T) {
-		resp, _ := app.ProcessProposal(context.Background(), &abcitypes.RequestProcessProposal{Txs: [][]byte{[]byte("invalid")}})
-		if resp.Status != abcitypes.ResponseProcessProposal_REJECT {
-			t.Fatalf("expected rejected proposal, got %v", resp.Status)
-		}
-	})
+	processed, err := app.ProcessProposal(context.Background(), &abcitypes.RequestProcessProposal{Height: 1, Time: proposalTime, Txs: proposal})
+	if err != nil || processed.Status != abcitypes.ResponseProcessProposal_ACCEPT {
+		t.Fatalf("proposal not accepted: response=%+v error=%v", processed, err)
+	}
 
-	t.Run("Finalize Persists Accepted Delivery And App State", func(t *testing.T) {
-		txBytes := createTx(2, chainID, true)
-		resp, err := app.FinalizeBlock(context.Background(), &abcitypes.RequestFinalizeBlock{Height: 1, Txs: [][]byte{txBytes}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(resp.AppHash) == 0 {
-			t.Fatal("expected deterministic app hash")
-		}
-		hash, _ := transactionHash(txBytes)
-		status, ok := b.txPool.GetDelivery(hash)
-		if !ok || status.Status != DeliveryAccepted {
-			t.Fatalf("delivery status = %+v, found=%v", status, ok)
-		}
-		info, err := app.Info(context.Background(), &abcitypes.RequestInfo{})
-		if err != nil || info.LastBlockHeight != 1 || len(info.LastBlockAppHash) == 0 {
-			t.Fatalf("info = %+v, err=%v", info, err)
-		}
-	})
+	finalized, err := app.FinalizeBlock(context.Background(), &abcitypes.RequestFinalizeBlock{Height: 1, Time: proposalTime, Txs: proposal})
+	if err != nil || len(finalized.AppHash) != common.HashLength {
+		t.Fatalf("proposal not finalized: response=%+v error=%v", finalized, err)
+	}
+	info, _ := app.Info(context.Background(), &abcitypes.RequestInfo{})
+	if info.LastBlockHeight != 0 {
+		t.Fatal("finalized proposal became committed before Commit")
+	}
+	if _, err := app.Commit(context.Background(), &abcitypes.RequestCommit{}); err != nil {
+		t.Fatal(err)
+	}
+	info, _ = app.Info(context.Background(), &abcitypes.RequestInfo{})
+	if info.LastBlockHeight != 1 || info.LastBlockAppHash == nil || b.getHeightHash(1) != payload.BlockHash {
+		t.Fatalf("committed info mismatch: %+v", info)
+	}
+}
 
-	t.Run("Finalize Rolls Back Delivery When Persistence Fails", func(t *testing.T) {
-		previousHeight := b.abciLastBlockHeight.Load()
-		previousHash := b.appHash()
-		previousPending, previousDeliveries := b.txPool.Snapshot()
-		b.config.Bridge.StateFile = t.TempDir() // Renaming a state file over a directory must fail.
-		txBytes := createTx(3, chainID, true)
-		if _, err := app.FinalizeBlock(context.Background(), &abcitypes.RequestFinalizeBlock{Height: 2, Txs: [][]byte{txBytes}}); err == nil {
-			t.Fatal("expected persistence failure")
-		}
-		if got := b.abciLastBlockHeight.Load(); got != previousHeight {
-			t.Fatalf("ABCI height = %d, want rollback to %d", got, previousHeight)
-		}
-		if got := b.appHash(); string(got) != string(previousHash) {
-			t.Fatalf("app hash was not rolled back")
-		}
-		pending, deliveries := b.txPool.Snapshot()
-		if len(pending) != len(previousPending) || len(deliveries) != len(previousDeliveries) {
-			t.Fatalf("delivery queue was not rolled back: pending=%d deliveries=%d", len(pending), len(deliveries))
-		}
-		hash, _ := transactionHash(txBytes)
-		if _, ok := b.txPool.GetDelivery(hash); ok {
-			t.Fatal("uncommitted transaction remains in delivery queue")
+func TestCommitRollsBackWhenPersistenceFails(t *testing.T) {
+	b := newTestBridge(t, func(_ context.Context, method string, _ interface{}) (json.RawMessage, error) {
+		switch method {
+		case "engine_newPayloadV2":
+			return json.RawMessage(`{"status":"VALID"}`), nil
+		case "engine_forkchoiceUpdatedV2":
+			return json.RawMessage(`{"payloadStatus":{"status":"VALID"},"payloadId":null}`), nil
+		default:
+			return nil, fmt.Errorf("unexpected method %s", method)
 		}
 	})
+	app := NewABCIApplication(b)
+	proposalTime := time.Unix(1_800_000_000, 0).UTC()
+	proposal, _ := testProposal(t, b, 1, proposalTime, [][]byte{signedTransactionBytes(t, 0)})
+	if _, err := app.FinalizeBlock(context.Background(), &abcitypes.RequestFinalizeBlock{Height: 1, Time: proposalTime, Txs: proposal}); err != nil {
+		t.Fatal(err)
+	}
+	b.config.Bridge.StateFile = t.TempDir()
+	if _, err := app.Commit(context.Background(), &abcitypes.RequestCommit{}); err == nil {
+		t.Fatal("expected persistence failure")
+	}
+	if b.abciLastBlockHeight.Load() != 0 || len(b.appHash()) != 0 || b.getHeightHash(1) != (common.Hash{}) {
+		t.Fatal("failed commit was not rolled back")
+	}
 }

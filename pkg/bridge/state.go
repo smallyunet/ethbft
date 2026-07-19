@@ -6,17 +6,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/smallyunet/ethbft/pkg/protocol"
 )
 
-const persistedStateVersion = 2
+const persistedStateVersion = 3
 
 type persistedBridgeState struct {
 	Version             int                            `json:"version"`
+	ProtocolVersion     uint64                         `json:"protocolVersion"`
 	ChainID             string                         `json:"chainId"`
 	ELGenesis           common.Hash                    `json:"elGenesis"`
 	LastProducedHeight  int64                          `json:"lastProducedHeight"`
@@ -25,7 +29,6 @@ type persistedBridgeState struct {
 	Deliveries          map[common.Hash]DeliveryStatus `json:"deliveries,omitempty"`
 	ABCILastBlockHeight int64                          `json:"abciLastBlockHeight"`
 	ABCILastAppHash     []byte                         `json:"abciLastAppHash,omitempty"`
-	LegacyEmptyAppHash  bool                           `json:"legacyEmptyAppHash,omitempty"`
 }
 
 func (b *Bridge) getHeightHash(h int64) common.Hash {
@@ -74,6 +77,7 @@ func (b *Bridge) snapshotState() persistedBridgeState {
 	}
 	return persistedBridgeState{
 		Version:             persistedStateVersion,
+		ProtocolVersion:     protocol.VersionV1,
 		ChainID:             chainID,
 		ELGenesis:           b.elGenesis,
 		LastProducedHeight:  b.lastProducedHeight.Load(),
@@ -82,7 +86,6 @@ func (b *Bridge) snapshotState() persistedBridgeState {
 		Deliveries:          deliveries,
 		ABCILastBlockHeight: b.abciLastBlockHeight.Load(),
 		ABCILastAppHash:     b.appHash(),
-		LegacyEmptyAppHash:  b.legacyEmptyAppHash.Load(),
 	}
 }
 
@@ -100,14 +103,37 @@ func (b *Bridge) saveState() error {
 		path = "ethbft_state.json"
 	}
 	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
+	file, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		b.statePersisted.Store(false)
+		return fmt.Errorf("open temp state file: %w", err)
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
 		b.statePersisted.Store(false)
 		return fmt.Errorf("write temp state file: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		b.statePersisted.Store(false)
+		return fmt.Errorf("sync temp state file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		b.statePersisted.Store(false)
+		return fmt.Errorf("close temp state file: %w", err)
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
 		b.statePersisted.Store(false)
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("rename temp state file: %w", err)
+	}
+	if directory, err := os.Open(filepath.Dir(path)); err == nil {
+		if syncErr := directory.Sync(); syncErr != nil {
+			_ = directory.Close()
+			b.statePersisted.Store(false)
+			return fmt.Errorf("sync state directory: %w", syncErr)
+		}
+		_ = directory.Close()
 	}
 	b.statePersisted.Store(true)
 	return nil
@@ -130,24 +156,8 @@ func (b *Bridge) loadState() error {
 	if err := json.Unmarshal(data, &state); err != nil {
 		return fmt.Errorf("unmarshal state: %w", err)
 	}
-	if state.Version == 0 && state.HeightToHash == nil {
-		var legacy map[int64]common.Hash
-		if err := json.Unmarshal(data, &legacy); err != nil {
-			return fmt.Errorf("unmarshal legacy state: %w", err)
-		}
-		state.HeightToHash = legacy
-		for height := range legacy {
-			if height > state.LastProducedHeight {
-				state.LastProducedHeight = height
-			}
-		}
-		// v0.0.9 committed an empty app hash. Reporting the last delivered height
-		// lets CometBFT replay only any consensus blocks the bridge had not handled.
-		state.ABCILastBlockHeight = state.LastProducedHeight
-		state.LegacyEmptyAppHash = true
-		b.logger.Warn("Loaded legacy state; it will be migrated after reconciliation")
-	} else if state.Version != persistedStateVersion {
-		return fmt.Errorf("unsupported state version %d", state.Version)
+	if state.Version != persistedStateVersion || state.ProtocolVersion != protocol.VersionV1 {
+		return fmt.Errorf("state version %d/protocol %d is incompatible with execution-payload consensus v1; start a new chain", state.Version, state.ProtocolVersion)
 	}
 	if state.ChainID != "" && b.chainID != nil && state.ChainID != b.chainID.String() {
 		return fmt.Errorf("state chain ID %s does not match execution chain ID %s", state.ChainID, b.chainID)
@@ -170,11 +180,59 @@ func (b *Bridge) loadState() error {
 
 	b.lastProducedHeight.Store(state.LastProducedHeight)
 	b.abciLastBlockHeight.Store(state.ABCILastBlockHeight)
-	b.legacyEmptyAppHash.Store(state.LegacyEmptyAppHash)
 	b.setAppHash(state.ABCILastAppHash)
 	b.txPool.Restore(state.PendingTransactions, state.Deliveries)
 	b.statePersisted.Store(true)
 	b.logger.Info("Loaded state", "bridge_height", state.LastProducedHeight, "abci_height", state.ABCILastBlockHeight, "pending_heights", len(state.PendingTransactions))
+	return nil
+}
+
+// commitPendingExecution makes the decided execution block visible to ABCI and
+// durable state. FinalizeBlock has already validated it and advanced local EL
+// forkchoice; Commit is the durability boundary reported by Info after restart.
+func (b *Bridge) commitPendingExecution() error {
+	pending := b.pendingCommit
+	if pending == nil {
+		return fmt.Errorf("no pending execution commit")
+	}
+
+	b.heightMu.RLock()
+	previousHeights := make(map[int64]common.Hash, len(b.heightToHash))
+	for height, hash := range b.heightToHash {
+		previousHeights[height] = hash
+	}
+	previousOrder := append([]int64(nil), b.heightOrder...)
+	b.heightMu.RUnlock()
+	previousProducedHeight := b.lastProducedHeight.Load()
+	previousABCIHeight := b.abciLastBlockHeight.Load()
+	previousAppHash := b.appHash()
+	previousPending, previousDeliveries := b.txPool.Snapshot()
+
+	if err := b.txPool.AddTxs(pending.height, pending.txs); err != nil {
+		return fmt.Errorf("record committed execution transactions: %w", err)
+	}
+	b.txPool.CompleteHeight(pending.height, pending.payload.BlockHash)
+	b.setHeightHash(pending.height, pending.payload.BlockHash)
+	b.lastProducedHeight.Store(pending.height)
+	b.abciLastBlockHeight.Store(pending.height)
+	b.setAppHash(pending.appHash)
+	b.lastProgressUnix.Store(time.Now().Unix())
+
+	if err := b.saveState(); err != nil {
+		b.heightMu.Lock()
+		b.heightToHash = previousHeights
+		b.heightOrder = previousOrder
+		b.heightMu.Unlock()
+		b.lastProducedHeight.Store(previousProducedHeight)
+		b.abciLastBlockHeight.Store(previousABCIHeight)
+		b.setAppHash(previousAppHash)
+		b.txPool.Restore(previousPending, previousDeliveries)
+		return fmt.Errorf("persist committed execution state: %w", err)
+	}
+	currentHeight.Set(float64(pending.height))
+	txsBridged.Add(float64(len(pending.txs)))
+	b.txPool.Prune(pending.height - int64(b.maxHistory))
+	b.pendingCommit = nil
 	return nil
 }
 

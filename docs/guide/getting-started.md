@@ -24,6 +24,17 @@ make deploy
 docker-compose logs -f
 ```
 
+If the machine previously ran v0.0.x, delete the disposable development-chain
+state before starting v0.1.0:
+
+```bash
+docker-compose down -v
+rm -rf geth_data cometbft_home
+```
+
+This deliberately destroys the local development chain because v0.0.x app
+hashes did not commit to Ethereum execution.
+
 ### Access Points
 
 After running `make deploy`, the following services are available:
@@ -36,7 +47,8 @@ After running `make deploy`, the following services are available:
 
 ## Manual Setup (Without Docker)
 
-You need three processes: Geth (execution), EthBFT (bridge), and CometBFT (consensus).
+You need three processes: Geth (execution), EthBFT (ABCI/Engine adapter), and
+CometBFT (consensus).
 
 ```bash
 # 1. Start Geth with Engine API enabled
@@ -49,5 +61,8 @@ geth \
 cometbft start --home ./cometbft_home
 
 # 3. Run EthBFT
-ETHBFT_CONFIG=./config.yaml ./ethbft
+ETHBFT_CONFIG=./config/config.yaml ./ethbft
 ```
+
+The bundled configuration supports Engine API V2 on a Shanghai-only chain.
+Blob transactions and later Engine API versions are rejected in protocol v1.

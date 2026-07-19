@@ -80,8 +80,8 @@ func TestE2E(t *testing.T) {
 		testBridgedTransaction(t, client)
 	})
 
-	t.Run("RejectedTransactionDoesNotStall", func(t *testing.T) {
-		testRejectedTransactionDoesNotStall(t, client)
+	t.Run("NonExecutableTransactionDoesNotStall", func(t *testing.T) {
+		testNonExecutableTransactionDoesNotStall(t, client)
 	})
 
 	t.Run("RestartRecovery", func(t *testing.T) {
@@ -102,6 +102,19 @@ func setupEnvironment(t *testing.T) (string, error) {
 		rootDir = filepath.Dir(cwd)
 	}
 
+	// A previous local stack may still hold bind mounts under e2e/data. Stop it
+	// before replacing the test directories, otherwise a restarted container can
+	// observe an unlinked datadir and lose the execution block it just committed.
+	down := getDockerComposeCommand(
+		"-f", "docker-compose.yml",
+		"-f", "e2e/docker-compose.override.yml",
+		"down", "-v", "--remove-orphans",
+	)
+	down.Dir = rootDir
+	if output, downErr := down.CombinedOutput(); downErr != nil {
+		t.Logf("pre-test docker-compose down failed: %v\n%s", downErr, output)
+	}
+
 	dataDir := filepath.Join(rootDir, "e2e", "data")
 	if err := os.RemoveAll(dataDir); err != nil {
 		return "", fmt.Errorf("failed to clean data dir: %w", err)
@@ -115,6 +128,9 @@ func setupEnvironment(t *testing.T) (string, error) {
 		return "", err
 	}
 	if err := os.MkdirAll(filepath.Join(dataDir, "cometbft"), 0777); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Join(dataDir, "ethbft"), 0777); err != nil {
 		return "", err
 	}
 
@@ -174,6 +190,9 @@ bridge:
 	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte(configContent), 0644); err != nil {
 		return "", err
 	}
+	// Docker Desktop may observe bind-mounted files a moment after the host has
+	// recreated the directory tree.
+	time.Sleep(500 * time.Millisecond)
 
 	return rootDir, nil
 }
@@ -474,7 +493,7 @@ func testRestartRecovery(t *testing.T, rootDir string, client *ethclient.Client)
 	}
 }
 
-func testRejectedTransactionDoesNotStall(t *testing.T, client *ethclient.Client) {
+func testNonExecutableTransactionDoesNotStall(t *testing.T, client *ethclient.Client) {
 	key, err := crypto.GenerateKey()
 	if err != nil {
 		t.Fatal(err)
@@ -522,22 +541,15 @@ func testRejectedTransactionDoesNotStall(t *testing.T, client *ethclient.Client)
 	}
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		statusResp, statusErr := http.Get("http://localhost:8081/tx/" + signed.Hash().Hex())
-		if statusErr == nil {
-			var delivery struct {
-				Status string `json:"status"`
+		after, blockErr := client.BlockNumber(context.Background())
+		if blockErr == nil && after > before {
+			if _, receiptErr := client.TransactionReceipt(context.Background(), signed.Hash()); receiptErr == nil {
+				t.Fatal("non-executable transaction unexpectedly entered a committed payload")
 			}
-			decodeErr := json.NewDecoder(statusResp.Body).Decode(&delivery)
-			statusResp.Body.Close()
-			if decodeErr == nil && delivery.Status == "rejected" {
-				after, blockErr := client.BlockNumber(context.Background())
-				if blockErr == nil && after > before {
-					return
-				}
-			}
+			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("non-includable transaction was not rejected or stalled block production")
+			t.Fatal("non-executable transaction stalled BFT execution block production")
 		}
 		time.Sleep(500 * time.Millisecond)
 	}

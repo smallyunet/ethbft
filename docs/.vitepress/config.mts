@@ -3,7 +3,7 @@ import { defineConfig } from 'vitepress'
 // https://vitepress.dev/reference/site-config
 export default defineConfig({
     title: "EthBFT",
-    description: "Ethereum ↔ CometBFT Minimal Bridge",
+    description: "BFT consensus adapter for Ethereum Execution Layer clients",
     base: '/ethbft/',
     ignoreDeadLinks: true,
     themeConfig: {
@@ -20,6 +20,12 @@ export default defineConfig({
                     { text: 'Introduction', link: '/guide/introduction' },
                     { text: 'Getting Started', link: '/guide/getting-started' },
                     { text: 'Architecture', link: '/guide/architecture' }
+                ]
+            },
+            {
+                text: 'RFCs',
+                items: [
+                    { text: 'RFC 0001: Execution Payload Consensus', link: '/rfc/0001-execution-payload-consensus' }
                 ]
             }
         ],

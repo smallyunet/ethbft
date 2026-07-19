@@ -10,6 +10,7 @@ services:
       - ./e2e/data/config.yaml:/app/config.yaml
       - ./e2e/data/jwt.hex:/app/jwt.hex
       - ./e2e/data/cometbft:/cometbft
+      - ./e2e/data/ethbft:/app/data
 
   cometbft:
     user: "0:0"  # Run as root to avoid permission issues in CI

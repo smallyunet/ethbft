@@ -1,15 +1,17 @@
 package config
 
 import (
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/ethereum/go-ethereum/common"
 	"gopkg.in/yaml.v3"
 )
 
-const DefaultAppVersion = "0.0.10"
+const DefaultAppVersion = "0.1.0"
 
 // Config stores all configuration for the EthBFT application
 type Config struct {
@@ -28,20 +30,19 @@ type Config struct {
 
 	// Bridge configuration
 	Bridge struct {
-		ListenAddr          string `yaml:"listenAddr"`          // Address to listen on (e.g., "0.0.0.0:8080")
-		LogLevel            string `yaml:"logLevel"`            // Log level (debug, info, warn, error)
-		EnableBridging      bool   `yaml:"enableBridging"`      // Whether to enable actual CometBFT->Geth bridging
-		Timeout             int    `yaml:"timeout"`             // Global timeout in seconds for operations
-		FeeRecipient        string `yaml:"feeRecipient"`        // Address to receive block rewards
-		FinalityDepth       int    `yaml:"finalityDepth"`       // Deprecated: use SafeDepth/FinalizedDepth
-		SafeDepth           int    `yaml:"safeDepth"`           // Number of blocks behind head for safe
-		FinalizedDepth      int    `yaml:"finalizedDepth"`      // Number of blocks behind head for finalized
-		StateFile           string `yaml:"stateFile"`           // Path to state persistence file
-		HealthAddr          string `yaml:"healthAddr"`          // Address for health/metrics server
-		AppVersion          string `yaml:"appVersion"`          // Application version reported to ABCI
-		MaxBridgeLag        int64  `yaml:"maxBridgeLag"`        // Maximum healthy CometBFT-to-bridge height lag
-		StallTimeout        int    `yaml:"stallTimeout"`        // Seconds without bridge progress before unhealthy
-		MaxDeliveryAttempts int    `yaml:"maxDeliveryAttempts"` // Retry limit before a non-includable tx is rejected
+		ListenAddr     string `yaml:"listenAddr"`     // Address to listen on (e.g., "0.0.0.0:8080")
+		LogLevel       string `yaml:"logLevel"`       // Log level (debug, info, warn, error)
+		EnableBridging bool   `yaml:"enableBridging"` // Whether to enable actual CometBFT->Geth bridging
+		Timeout        int    `yaml:"timeout"`        // Global timeout in seconds for operations
+		FeeRecipient   string `yaml:"feeRecipient"`   // Address to receive block rewards
+		FinalityDepth  int    `yaml:"finalityDepth"`  // Deprecated: use SafeDepth/FinalizedDepth
+		SafeDepth      int    `yaml:"safeDepth"`      // Number of blocks behind head for safe
+		FinalizedDepth int    `yaml:"finalizedDepth"` // Number of blocks behind head for finalized
+		StateFile      string `yaml:"stateFile"`      // Path to state persistence file
+		HealthAddr     string `yaml:"healthAddr"`     // Address for health/metrics server
+		AppVersion     string `yaml:"appVersion"`     // Application version reported to ABCI
+		MaxBridgeLag   int64  `yaml:"maxBridgeLag"`   // Maximum healthy CometBFT-to-bridge height lag
+		StallTimeout   int    `yaml:"stallTimeout"`   // Seconds without bridge progress before unhealthy
 	} `yaml:"bridge"`
 }
 
@@ -71,7 +72,6 @@ func DefaultConfig() *Config {
 	cfg.Bridge.AppVersion = DefaultAppVersion
 	cfg.Bridge.MaxBridgeLag = 5
 	cfg.Bridge.StallTimeout = 30
-	cfg.Bridge.MaxDeliveryAttempts = 10
 
 	return cfg
 }
@@ -124,7 +124,43 @@ func Load() (*Config, error) {
 		}
 	}
 
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	return cfg, nil
+}
+
+// Validate rejects local configuration that could make execution consensus
+// differ between validators. Protocol v1 deliberately supports Engine API V2
+// only and finalizes exactly the block decided by CometBFT.
+func (c *Config) Validate() error {
+	if strings.TrimSpace(c.Ethereum.Endpoint) == "" {
+		return fmt.Errorf("ethereum endpoint cannot be empty")
+	}
+	if strings.TrimSpace(c.Ethereum.EngineAPI) == "" {
+		return fmt.Errorf("ethereum engineAPI cannot be empty")
+	}
+	if strings.TrimSpace(c.CometBFT.Endpoint) == "" {
+		return fmt.Errorf("cometbft endpoint cannot be empty")
+	}
+	if !c.Bridge.EnableBridging {
+		return fmt.Errorf("execution-payload consensus v1 requires enableBridging=true")
+	}
+	if c.Bridge.SafeDepth != 0 || c.Bridge.FinalizedDepth != 0 || c.Bridge.FinalityDepth != 0 {
+		return fmt.Errorf("execution-payload consensus v1 finalizes CometBFT-decided blocks; local finality depths must be zero")
+	}
+	if c.Bridge.Timeout <= 0 {
+		return fmt.Errorf("bridge timeout must be positive")
+	}
+	if c.Bridge.FeeRecipient != "" && !common.IsHexAddress(c.Bridge.FeeRecipient) {
+		return fmt.Errorf("invalid bridge feeRecipient %q", c.Bridge.FeeRecipient)
+	}
+	switch strings.ToLower(c.Bridge.LogLevel) {
+	case "debug", "info", "warn", "error":
+	default:
+		return fmt.Errorf("invalid bridge logLevel %q", c.Bridge.LogLevel)
+	}
+	return nil
 }
 
 func replaceHost(rawURL, newHost string) string {

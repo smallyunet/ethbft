@@ -1,421 +1,374 @@
 package bridge
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
+	gethengine "github.com/ethereum/go-ethereum/beacon/engine"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/prometheus/client_golang/prometheus"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/smallyunet/ethbft/pkg/protocol"
 )
 
-func zeroHash() common.Hash { return common.Hash{} }
-
-func (b *Bridge) finalityHashes(head common.Hash, height int64) (common.Hash, common.Hash) {
-	hashAtDepth := func(depth int) common.Hash {
-		if depth <= 0 {
-			return head
-		}
-		target := height - int64(depth)
-		if target <= 0 {
-			return b.elGenesis
-		}
-		if hash := b.getHeightHash(target); hash != (common.Hash{}) {
-			return hash
-		}
-		return b.elGenesis
-	}
-	safeDepth := b.config.Bridge.SafeDepth
-	finalizedDepth := b.config.Bridge.FinalizedDepth
-	if b.config.Bridge.FinalityDepth > 0 {
-		if safeDepth == 0 {
-			safeDepth = b.config.Bridge.FinalityDepth
-		}
-		if finalizedDepth == 0 {
-			finalizedDepth = b.config.Bridge.FinalityDepth
-		}
-	}
-	return hashAtDepth(safeDepth), hashAtDepth(finalizedDepth)
+type pendingExecutionCommit struct {
+	height  int64
+	payload *ExecutionPayload
+	appHash []byte
+	txs     [][]byte
 }
 
-func missingTransactionHashes(expected, included [][]byte) ([]common.Hash, error) {
-	includedHashes := make(map[common.Hash]struct{}, len(included))
-	for _, raw := range included {
-		hash, err := transactionHash(raw)
-		if err != nil {
-			return nil, fmt.Errorf("decode payload transaction: %w", err)
-		}
-		includedHashes[hash] = struct{}{}
+func (b *Bridge) operationTimeout() time.Duration {
+	timeout := 8 * time.Second
+	if b.config != nil && b.config.Bridge.Timeout > 0 {
+		timeout = time.Duration(b.config.Bridge.Timeout) * time.Second
 	}
-	missing := make([]common.Hash, 0)
-	for _, raw := range expected {
-		hash, err := transactionHash(raw)
-		if err != nil {
-			return nil, err
-		}
-		if _, ok := includedHashes[hash]; !ok {
-			missing = append(missing, hash)
-		}
-	}
-	return missing, nil
+	return timeout
 }
 
-func terminalInjectionError(err error) bool {
-	if err == nil {
-		return false
+func (b *Bridge) committedExecutionParent(height int64) common.Hash {
+	if height > 1 {
+		return b.getHeightHash(height - 1)
 	}
-	message := strings.ToLower(err.Error())
-	for _, fragment := range []string{
-		"nonce too low",
-		"insufficient funds",
-		"intrinsic gas too low",
-		"exceeds block gas limit",
-		"invalid sender",
-		"transaction type not supported",
-	} {
-		if strings.Contains(message, fragment) {
-			return true
-		}
-	}
-	return false
+	return b.elGenesis
 }
 
-// getELHead returns the current EL head hash and its timestamp.
-func (b *Bridge) getELHead(ctx context.Context) (common.Hash, uint64, error) {
-	res, err := b.ethClient.Call(ctx, "eth_getBlockByNumber", []interface{}{"latest", false})
-	if err != nil {
-		return common.Hash{}, 0, fmt.Errorf("eth_getBlockByNumber(latest): %w", err)
+func (b *Bridge) configuredFeeRecipient() (common.Address, error) {
+	if b.config == nil || strings.TrimSpace(b.config.Bridge.FeeRecipient) == "" {
+		return common.Address{}, nil
 	}
-	var blk map[string]any
-	if err := json.Unmarshal(res, &blk); err != nil {
-		return common.Hash{}, 0, fmt.Errorf("decode latest block: %w", err)
+	if !common.IsHexAddress(b.config.Bridge.FeeRecipient) {
+		return common.Address{}, fmt.Errorf("invalid fee recipient %q", b.config.Bridge.FeeRecipient)
 	}
-	h, _ := blk["hash"].(string)
-	tsStr, _ := blk["timestamp"].(string)
-	if h == "" || tsStr == "" {
-		return common.Hash{}, 0, fmt.Errorf("latest block missing hash/timestamp")
-	}
-	// ts is hex string like "0x..."
-	var ts uint64
-	_, _ = fmt.Sscanf(strings.TrimPrefix(tsStr, "0x"), "%x", &ts)
-	return common.HexToHash(h), ts, nil
+	return common.HexToAddress(b.config.Bridge.FeeRecipient), nil
 }
 
-// getBlockTimestampByHash returns timestamp for a given block hash (0 on failure).
-func (b *Bridge) getBlockTimestampByHash(ctx context.Context, h common.Hash) uint64 {
-	if (h == common.Hash{}) {
+func (b *Bridge) proposalRandao(height int64) common.Hash {
+	chainID := make([]byte, 32)
+	if b.chainID != nil {
+		b.chainID.FillBytes(chainID)
+	}
+	var heightBytes [8]byte
+	binary.BigEndian.PutUint64(heightBytes[:], uint64(height))
+	return crypto.Keccak256Hash(
+		[]byte("ETHBFT_PREVRANDAO_V1"),
+		chainID,
+		heightBytes[:],
+		b.appHash(),
+	)
+}
+
+func (b *Bridge) getBlockTimestampByHash(ctx context.Context, hash common.Hash) uint64 {
+	if hash == (common.Hash{}) {
 		return 0
 	}
-
-	// Check cache
 	b.tsMu.RLock()
-	ts, ok := b.tsCache[h]
-	b.tsMu.RUnlock()
-	if ok {
-		return ts
+	if timestamp, ok := b.tsCache[hash]; ok {
+		b.tsMu.RUnlock()
+		return timestamp
 	}
-
-	res, err := b.ethClient.Call(ctx, "eth_getBlockByHash", []interface{}{h.Hex(), false})
+	b.tsMu.RUnlock()
+	raw, err := b.ethClient.Call(ctx, "eth_getBlockByHash", []interface{}{hash.Hex(), false})
 	if err != nil {
 		return 0
 	}
-	var blk map[string]any
-	if json.Unmarshal(res, &blk) != nil {
+	var block struct {
+		Timestamp string `json:"timestamp"`
+	}
+	if err := json.Unmarshal(raw, &block); err != nil || block.Timestamp == "" {
 		return 0
 	}
-	tsStr, _ := blk["timestamp"].(string)
-	if tsStr == "" {
+	timestamp, err := hexutil.DecodeUint64(block.Timestamp)
+	if err != nil {
 		return 0
 	}
-	var timestamp uint64
-	_, _ = fmt.Sscanf(strings.TrimPrefix(tsStr, "0x"), "%x", &timestamp)
-
-	// Save to cache
 	b.tsMu.Lock()
-	b.tsCache[h] = timestamp
-	// Bound cache size
-	if len(b.tsCache) > 1024 {
-		for k := range b.tsCache {
-			delete(b.tsCache, k)
+	if len(b.tsCache) >= 1024 {
+		for cached := range b.tsCache {
+			delete(b.tsCache, cached)
 			break
 		}
 	}
+	b.tsCache[hash] = timestamp
 	b.tsMu.Unlock()
-
 	return timestamp
 }
 
-// produceBlockAtHeight executes the minimal Engine API loop to let Geth build a block.
-func (b *Bridge) produceBlockAtHeight(height int64) (err error) {
-	timer := prometheus.NewTimer(blockProductionDuration)
-	defer timer.ObserveDuration()
-	defer func() {
-		if err != nil {
-			rpcErrors.Inc()
+func (b *Bridge) injectProposalCandidates(ctx context.Context, candidates [][]byte) {
+	for _, raw := range candidates {
+		if protocol.IsEnvelope(raw) {
+			continue
 		}
-	}()
-
-	// 0) Inject transactions from TxPool into Geth Mempool
-	txs := b.txPool.GetTxs(height)
-	timeout := 8 * time.Second
-	if b.config.Bridge.Timeout > 0 {
-		timeout = time.Duration(b.config.Bridge.Timeout) * time.Second
-	}
-
-	if len(txs) > 0 {
-		b.logger.Info("Injecting transactions into Geth", "height", height, "count", len(txs))
-		ctxTx, cancelTx := context.WithTimeout(b.ctx, timeout)
-		defer cancelTx()
-
-		for _, tx := range txs {
-			txHex := hexutil.Encode(tx)
-			_, injectErr := b.ethClient.Call(ctxTx, "eth_sendRawTransaction", []interface{}{txHex})
-			if injectErr != nil && !strings.Contains(strings.ToLower(injectErr.Error()), "already known") {
-				txsInjectionFailed.Inc()
-				if terminalInjectionError(injectErr) {
-					b.txPool.Reject(tx, injectErr)
-					b.logger.Warn("Rejected non-includable transaction", "error", injectErr)
-					continue
-				}
-				attempts := b.txPool.MarkRetrying(tx, injectErr)
-				maxAttempts := b.config.Bridge.MaxDeliveryAttempts
-				if maxAttempts > 0 && attempts >= maxAttempts {
-					b.txPool.Reject(tx, fmt.Errorf("delivery retry limit reached after %d attempts: %w", attempts, injectErr))
-					continue
-				}
-				if stateErr := b.saveState(); stateErr != nil {
-					b.logger.Error("Failed to persist transaction retry state", "error", stateErr)
-				}
-				return fmt.Errorf("inject transaction: %w", injectErr)
-			}
-			b.txPool.MarkInjected(tx)
+		if code, message := validateTransaction(raw, b.chainID); code != 0 {
+			b.logger.Debug("Skipping invalid proposal candidate", "reason", message)
+			continue
 		}
-		txs = b.txPool.GetTxs(height)
-	}
-
-	// 1) Choose parent: prefer last height's head; otherwise EL head; otherwise genesis.
-	parent := b.getHeightHash(height - 1)
-
-	var parentTs uint64
-	if (parent == common.Hash{}) {
-		ctxHead, cancelHead := context.WithTimeout(b.ctx, timeout)
-		head, headTs, err := b.getELHead(ctxHead)
-		cancelHead()
-		if err == nil && (head != common.Hash{}) {
-			parent = head
-			parentTs = headTs
-		} else if b.elGenesis != (common.Hash{}) {
-			parent = b.elGenesis
-			ctxTs, cancelTs := context.WithTimeout(b.ctx, timeout)
-			parentTs = b.getBlockTimestampByHash(ctxTs, parent)
-			cancelTs()
+		_, err := b.ethClient.Call(ctx, "eth_sendRawTransaction", []interface{}{hexutil.Encode(raw)})
+		if err != nil && !strings.Contains(strings.ToLower(err.Error()), "already known") {
+			b.logger.Debug("Skipping non-injectable proposal candidate", "error", err)
 		}
-	} else {
-		ctxTs, cancelTs := context.WithTimeout(b.ctx, timeout)
-		parentTs = b.getBlockTimestampByHash(ctxTs, parent)
-		cancelTs()
+	}
+}
+
+// buildExecutionProposal asks the proposer's dedicated EL to build the complete
+// payload, then turns the payload into the exact CometBFT proposal contents.
+func (b *Bridge) buildExecutionProposal(height int64, proposalTime time.Time, candidates [][]byte, maxTxBytes int64) ([][]byte, error) {
+	if height <= 0 {
+		return nil, fmt.Errorf("invalid proposal height %d", height)
+	}
+	parent := b.committedExecutionParent(height)
+	if parent == (common.Hash{}) {
+		return nil, fmt.Errorf("no committed execution parent for height %d", height)
+	}
+	feeRecipient, err := b.configuredFeeRecipient()
+	if err != nil {
+		return nil, err
+	}
+	if proposalTime.IsZero() || proposalTime.Unix() <= 0 {
+		return nil, fmt.Errorf("invalid CometBFT proposal time")
+	}
+	timestamp := uint64(proposalTime.Unix())
+	ctx, cancel := context.WithTimeout(b.ctx, b.operationTimeout())
+	defer cancel()
+	parentTimestamp := b.getBlockTimestampByHash(ctx, parent)
+	if parentTimestamp > 0 && timestamp <= parentTimestamp {
+		return nil, fmt.Errorf("proposal timestamp %d is not greater than parent timestamp %d", timestamp, parentTimestamp)
 	}
 
-	if (parent == common.Hash{}) {
-		return fmt.Errorf("no valid parent available (zero hash); ensure EL is up and has a head")
+	b.injectProposalCandidates(ctx, candidates)
+	if err := b.sendForkchoiceUpdate(parent, parent, parent); err != nil {
+		return nil, fmt.Errorf("prepare parent forkchoice: %w", err)
 	}
 
-	// 2) Pre-forkchoice without attributes. Preserve configured safe/finalized depths.
-	preSafe, preFinalized := b.finalityHashes(parent, height-1)
-	if err := b.sendForkchoiceUpdate(parent, preSafe, preFinalized); err != nil {
-		return fmt.Errorf("pre-fcu failed: %w", err)
-	}
-
-	// 3) Minimal attributes
-	now := uint64(time.Now().Unix())
-	ts := now
-	if parentTs > 0 && ts <= parentTs {
-		ts = parentTs + 1
-	}
-	feeRecipient := common.Address{}
-	if b.config.Bridge.FeeRecipient != "" {
-		feeRecipient = common.HexToAddress(b.config.Bridge.FeeRecipient)
-	}
 	attrs := &PayloadAttributes{
-		Timestamp:             ts,
-		Random:                zeroHash(),
+		Timestamp:             timestamp,
+		Random:                b.proposalRandao(height),
 		SuggestedFeeRecipient: feeRecipient,
 		Withdrawals:           []*types.Withdrawal{},
 	}
-
-	// 4) Forkchoice with attributes
-	ctx, cancel := context.WithTimeout(b.ctx, timeout)
-	defer cancel()
-
-	req := []any{
-		&FCURequest{Head: parent, Safe: preSafe, Finalized: preFinalized},
-		attrs,
-	}
+	req := []any{&FCURequest{Head: parent, Safe: parent, Finalized: parent}, attrs}
 	raw, err := b.ethClient.Call(ctx, "engine_forkchoiceUpdatedV2", req)
 	if err != nil {
-		return fmt.Errorf("fcu (with attrs) call: %w", err)
+		return nil, fmt.Errorf("start payload build: %w", err)
 	}
-	var fcuResp FCUResponse
-	if err := json.Unmarshal(raw, &fcuResp); err != nil {
-		return fmt.Errorf("decode fcu resp: %w", err)
+	var response FCUResponse
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return nil, fmt.Errorf("decode payload build response: %w", err)
 	}
-	if fcuResp.PayloadID == nil {
-		if fcuResp.PayloadStatus.Status == "SYNCING" {
-			return fmt.Errorf("engine is SYNCING, cannot produce payload")
-		}
-		time.Sleep(200 * time.Millisecond)
-		rawRetry, err := b.ethClient.Call(ctx, "engine_forkchoiceUpdatedV2", req)
-		if err != nil {
-			return fmt.Errorf("fcu retry call: %w", err)
-		}
-		if err := json.Unmarshal(rawRetry, &fcuResp); err != nil || fcuResp.PayloadID == nil {
-			return fmt.Errorf("no payloadId from fcu, status=%s err=%s",
-				fcuResp.PayloadStatus.Status, fcuResp.PayloadStatus.ValidationError)
-		}
+	if response.PayloadStatus.Status != "VALID" {
+		return nil, fmt.Errorf("payload build forkchoice status=%s error=%s", response.PayloadStatus.Status, response.PayloadStatus.ValidationError)
+	}
+	if response.PayloadID == nil {
+		return nil, fmt.Errorf("payload build returned no payload ID")
 	}
 
-	// 5) engine_getPayloadV2
-	raw2, err := b.ethClient.Call(ctx, "engine_getPayloadV2", []any{fcuResp.PayloadID})
+	raw, err = b.ethClient.Call(ctx, "engine_getPayloadV2", []any{response.PayloadID})
 	if err != nil {
-		return fmt.Errorf("getPayloadV2: %w", err)
+		return nil, fmt.Errorf("get execution payload: %w", err)
 	}
-	var gp struct {
+	var result struct {
 		ExecutionPayload ExecutionPayload `json:"executionPayload"`
 	}
-	if err := json.Unmarshal(raw2, &gp); err != nil {
-		return fmt.Errorf("decode getPayloadV2: %w", err)
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("decode execution payload: %w", err)
 	}
-	payload := &gp.ExecutionPayload
+	payload := &result.ExecutionPayload
+	if payload.ParentHash != parent || payload.Timestamp != timestamp || payload.Random != attrs.Random || payload.FeeRecipient != feeRecipient {
+		return nil, fmt.Errorf("builder returned payload with non-deterministic attributes")
+	}
+	if payload.Withdrawals == nil || len(payload.Withdrawals) != 0 {
+		return nil, fmt.Errorf("protocol v1 requires an explicit empty withdrawals list")
+	}
+	if _, err := gethengine.ExecutableDataToBlock(*payload, nil, nil, nil); err != nil {
+		return nil, fmt.Errorf("builder returned invalid payload: %w", err)
+	}
 
-	// 6) engine_newPayloadV2
-	raw3, err := b.ethClient.Call(ctx, "engine_newPayloadV2", []any{payload})
+	metadata, err := protocol.NewExecutionMetadataV1(b.chainID, height, b.appHash(), payload)
 	if err != nil {
-		return fmt.Errorf("newPayloadV2: %w", err)
+		return nil, err
 	}
-	var np struct {
-		Status          string `json:"status"`
-		LatestValidHash string `json:"latestValidHash"`
-		ValidationError string `json:"validationError"`
-	}
-	if err := json.Unmarshal(raw3, &np); err != nil {
-		return fmt.Errorf("decode newPayloadV2: %w", err)
-	}
-	switch np.Status {
-	case "VALID", "ACCEPTED":
-	case "SYNCING":
-		return fmt.Errorf("newPayloadV2 returned SYNCING, execution not ready")
-	default:
-		return fmt.Errorf("newPayloadV2 status=%s err=%s", np.Status, np.ValidationError)
-	}
-
-	// 7) Final forkchoice
-	head := payload.BlockHash
-	missing, err := missingTransactionHashes(txs, payload.Transactions)
+	envelope, err := protocol.EncodeEnvelope(metadata)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if len(missing) > 0 {
-		deliveryErr := fmt.Errorf("payload is missing %d accepted transactions: %v", len(missing), missing)
-		missingSet := make(map[common.Hash]struct{}, len(missing))
-		for _, hash := range missing {
-			missingSet[hash] = struct{}{}
-		}
-		remainingMissing := false
-		for _, tx := range txs {
-			hash, _ := transactionHash(tx)
-			if _, ok := missingSet[hash]; !ok {
-				continue
-			}
-			attempts := b.txPool.MarkRetrying(tx, deliveryErr)
-			maxAttempts := b.config.Bridge.MaxDeliveryAttempts
-			if maxAttempts > 0 && attempts >= maxAttempts {
-				b.txPool.Reject(tx, fmt.Errorf("delivery retry limit reached after %d attempts: %w", attempts, deliveryErr))
-			} else {
-				remainingMissing = true
-			}
-		}
-		if stateErr := b.saveState(); stateErr != nil {
-			b.logger.Error("Failed to persist missing transaction state", "error", stateErr)
-		}
-		if remainingMissing {
-			return deliveryErr
-		}
-		txs = b.txPool.GetTxs(height)
+	proposal := make([][]byte, 1, len(payload.Transactions)+1)
+	proposal[0] = envelope
+	totalBytes := int64(len(envelope))
+	for _, tx := range payload.Transactions {
+		copy := append([]byte(nil), tx...)
+		proposal = append(proposal, copy)
+		totalBytes += int64(len(copy))
 	}
-	if len(txs) > 0 {
-		b.logger.Info("Block produced with all accepted transactions", "height", height, "expected", len(txs), "included", len(payload.Transactions))
-	} else {
-		b.logger.Info("Produced block", "height", height, "head", head.Hex(), "txs", len(payload.Transactions))
+	if maxTxBytes > 0 && totalBytes > maxTxBytes {
+		return nil, fmt.Errorf("execution proposal uses %d bytes, maximum is %d", totalBytes, maxTxBytes)
 	}
-	newSafe, newFinalized := b.finalityHashes(head, height)
-
-	if err := b.sendForkchoiceUpdate(head, newSafe, newFinalized); err != nil {
-		return fmt.Errorf("final fcu failed: %w", err)
-	}
-
-	previousHeight := b.lastProducedHeight.Load()
-	previousHash := b.getHeightHash(height)
-	pendingSnapshot, deliverySnapshot := b.txPool.Snapshot()
-	b.setHeightHash(height, head)
-	b.lastProducedHeight.Store(height)
-	b.lastProgressUnix.Store(time.Now().Unix())
-	b.txPool.CompleteHeight(height, head)
-	if err := b.saveState(); err != nil {
-		b.txPool.Restore(pendingSnapshot, deliverySnapshot)
-		b.heightMu.Lock()
-		if previousHash == (common.Hash{}) {
-			delete(b.heightToHash, height)
-			for i, h := range b.heightOrder {
-				if h == height {
-					b.heightOrder = append(b.heightOrder[:i], b.heightOrder[i+1:]...)
-					break
-				}
-			}
-		} else {
-			b.heightToHash[height] = previousHash
-		}
-		b.heightMu.Unlock()
-		b.lastProducedHeight.Store(previousHeight)
-		return err
-	}
-	return nil
+	return proposal, nil
 }
 
-// parseCometHash converts upper-case/no-0x hex to go-ethereum common.Hash (0x-prefixed, lower-case).
-func parseCometHash(h string) common.Hash {
-	hs := strings.TrimSpace(h)
-	if hs == "" {
-		return common.Hash{}
+// validateExecutionProposal performs deterministic checks and asks the local EL
+// to independently validate the exact execution payload.
+func (b *Bridge) validateExecutionProposal(ctx context.Context, height int64, proposalTime time.Time, proposal [][]byte) (*ExecutionPayload, error) {
+	if len(proposal) == 0 {
+		return nil, fmt.Errorf("proposal has no execution envelope")
 	}
-	if !strings.HasPrefix(hs, "0x") {
-		hs = "0x" + strings.ToLower(hs)
+	metadata, err := protocol.DecodeEnvelope(proposal[0])
+	if err != nil {
+		return nil, err
 	}
-	return common.HexToHash(hs)
+	if metadata.ConsensusHeight != uint64(height) {
+		return nil, fmt.Errorf("metadata height %d does not match proposal height %d", metadata.ConsensusHeight, height)
+	}
+	if b.chainID == nil || metadata.ChainID.Cmp(b.chainID) != 0 {
+		return nil, fmt.Errorf("metadata chain ID %s does not match local chain ID", metadata.ChainID)
+	}
+	if !bytes.Equal(metadata.PreviousAppHash, b.appHash()) {
+		return nil, fmt.Errorf("metadata previous app hash does not match committed state")
+	}
+	parent := b.committedExecutionParent(height)
+	if metadata.ParentHash != parent {
+		return nil, fmt.Errorf("execution parent %s does not match committed parent %s", metadata.ParentHash, parent)
+	}
+	if proposalTime.IsZero() || metadata.Timestamp != uint64(proposalTime.Unix()) {
+		return nil, fmt.Errorf("execution timestamp %d does not match CometBFT time %d", metadata.Timestamp, proposalTime.Unix())
+	}
+	if metadata.PrevRandao != b.proposalRandao(height) {
+		return nil, fmt.Errorf("invalid deterministic prevRandao")
+	}
+	feeRecipient, err := b.configuredFeeRecipient()
+	if err != nil {
+		return nil, err
+	}
+	if metadata.FeeRecipient != feeRecipient {
+		return nil, fmt.Errorf("invalid fee recipient %s", metadata.FeeRecipient)
+	}
+	if len(metadata.Withdrawals) != 0 {
+		return nil, fmt.Errorf("protocol v1 requires empty withdrawals")
+	}
+
+	seen := make(map[common.Hash]struct{}, len(proposal)-1)
+	for _, rawTx := range proposal[1:] {
+		if protocol.IsEnvelope(rawTx) {
+			return nil, fmt.Errorf("multiple execution envelopes in proposal")
+		}
+		if code, message := validateTransaction(rawTx, b.chainID); code != 0 {
+			return nil, fmt.Errorf("invalid execution transaction: %s", message)
+		}
+		hash, err := transactionHash(rawTx)
+		if err != nil {
+			return nil, err
+		}
+		if _, exists := seen[hash]; exists {
+			return nil, fmt.Errorf("duplicate execution transaction %s", hash)
+		}
+		seen[hash] = struct{}{}
+	}
+
+	payload := metadata.Payload(proposal[1:])
+	if _, err := gethengine.ExecutableDataToBlock(payload, nil, nil, nil); err != nil {
+		return nil, fmt.Errorf("invalid execution payload commitment: %w", err)
+	}
+	raw, err := b.ethClient.Call(ctx, "engine_newPayloadV2", []any{&payload})
+	if err != nil {
+		return nil, fmt.Errorf("validate execution payload: %w", err)
+	}
+	var status PayloadStatus
+	if err := json.Unmarshal(raw, &status); err != nil {
+		return nil, fmt.Errorf("decode execution validation status: %w", err)
+	}
+	if status.Status != "VALID" {
+		return nil, fmt.Errorf("execution payload status=%s error=%s", status.Status, status.ValidationError)
+	}
+	if status.LatestValidHash != "" && status.LatestValidHash != "0x" && common.HexToHash(status.LatestValidHash) != payload.BlockHash {
+		return nil, fmt.Errorf("latest valid hash %s does not match payload block %s", status.LatestValidHash, payload.BlockHash)
+	}
+	return &payload, nil
 }
 
-// sendForkchoiceUpdate sets head/safe/finalized. Used both before and after producing a block.
+func (b *Bridge) stageExecutionCommit(height int64, proposalTime time.Time, proposal [][]byte) (*pendingExecutionCommit, error) {
+	ctx, cancel := context.WithTimeout(b.ctx, b.operationTimeout())
+	defer cancel()
+	payload, err := b.validateExecutionProposal(ctx, height, proposalTime, proposal)
+	if err != nil {
+		return nil, err
+	}
+	if err := b.sendForkchoiceUpdate(payload.BlockHash, payload.BlockHash, payload.BlockHash); err != nil {
+		return nil, fmt.Errorf("commit execution forkchoice: %w", err)
+	}
+	appHash, err := b.executionAppHash(height, payload)
+	if err != nil {
+		return nil, err
+	}
+	pending := &pendingExecutionCommit{
+		height:  height,
+		payload: payload,
+		appHash: appHash,
+		txs:     cloneRawTransactions(payload.Transactions),
+	}
+	b.pendingCommit = pending
+	return pending, nil
+}
+
+func (b *Bridge) executionAppHash(height int64, payload *ExecutionPayload) ([]byte, error) {
+	block, err := gethengine.ExecutableDataToBlock(*payload, nil, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	h := sha256.New()
+	_, _ = h.Write([]byte("ETHBFT_APP_HASH_V1"))
+	_, _ = h.Write(b.appHash())
+	chainID := make([]byte, 32)
+	b.chainID.FillBytes(chainID)
+	_, _ = h.Write(chainID)
+	var heightBytes [8]byte
+	binary.BigEndian.PutUint64(heightBytes[:], uint64(height))
+	_, _ = h.Write(heightBytes[:])
+	_, _ = h.Write(payload.ParentHash[:])
+	_, _ = h.Write(payload.BlockHash[:])
+	_, _ = h.Write(payload.StateRoot[:])
+	_, _ = h.Write(payload.ReceiptsRoot[:])
+	txRoot := block.TxHash()
+	_, _ = h.Write(txRoot[:])
+	return h.Sum(nil), nil
+}
+
+func cloneRawTransactions(transactions [][]byte) [][]byte {
+	out := make([][]byte, len(transactions))
+	for i := range transactions {
+		out[i] = append([]byte(nil), transactions[i]...)
+	}
+	return out
+}
+
+// sendForkchoiceUpdate sets head, safe, and finalized. Protocol v1 finalizes a
+// payload only after CometBFT has decided the containing proposal.
 func (b *Bridge) sendForkchoiceUpdate(head, safe, finalized common.Hash) error {
-	timeout := 8 * time.Second
-	if b.config.Bridge.Timeout > 0 {
-		timeout = time.Duration(b.config.Bridge.Timeout) * time.Second
-	}
-	ctx, cancel := context.WithTimeout(b.ctx, timeout)
+	ctx, cancel := context.WithTimeout(b.ctx, b.operationTimeout())
 	defer cancel()
 	state := &FCURequest{Head: head, Safe: safe, Finalized: finalized}
 	res, err := b.ethClient.Call(ctx, "engine_forkchoiceUpdatedV2", []interface{}{state, nil})
 	if err != nil {
 		return err
 	}
-	var resp FCUResponse
-	if err := json.Unmarshal(res, &resp); err != nil {
+	var response FCUResponse
+	if err := json.Unmarshal(res, &response); err != nil {
 		return fmt.Errorf("decode forkchoiceUpdated: %w", err)
 	}
-	if resp.PayloadStatus.Status != "VALID" && resp.PayloadStatus.Status != "ACCEPTED" {
-		return fmt.Errorf("forkchoice status=%s validationError=%s", resp.PayloadStatus.Status, resp.PayloadStatus.ValidationError)
+	if response.PayloadStatus.Status != "VALID" {
+		return fmt.Errorf("forkchoice status=%s validationError=%s", response.PayloadStatus.Status, response.PayloadStatus.ValidationError)
 	}
 	return nil
+}
+
+func observeProposalValidation(start time.Time, err error) {
+	blockProductionDuration.Observe(time.Since(start).Seconds())
+	if err != nil {
+		rpcErrors.Inc()
+	}
 }

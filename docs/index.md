@@ -3,8 +3,8 @@ layout: home
 
 hero:
   name: "EthBFT"
-  text: "Ethereum ↔ CometBFT"
-  tagline: "Minimal Bridge for Engine API Orchestration"
+  text: "BFT Ethereum Execution"
+  tagline: "A thin consensus adapter between CometBFT and the Engine API"
   image:
     src: https://vitepress.dev/vitepress-logo-large.png
     alt: EthBFT Logo
@@ -17,17 +17,17 @@ hero:
       link: https://github.com/smallyunet/ethbft
 
 features:
-  - title: Engine API Loop
-    details: Forkchoice plus payload production orchestrated by CometBFT height signals.
+  - title: Payload Consensus
+    details: CometBFT decides complete, ordered Ethereum execution payloads.
     icon: 🚀
-  - title: Seamless Integration
-    details: Works with Go-Ethereum (Geth) via standard Engine API and JWT authentication.
+  - title: Independent Validation
+    details: Every validator requires its dedicated Geth to return VALID.
     icon: 🔌
-  - title: High Performance
-    details: Lightweight and experimental, focusing on the core orchestration loop.
+  - title: Thin Adapter
+    details: CometBFT handles BFT, Geth handles EVM execution, and EthBFT binds them.
     icon: ⚡
-  - title: Ready for Demo
-    details: One-command deployment with Docker Compose for local development and testing.
+  - title: MVP Network
+    details: One-command Docker deployment with commit recovery and execution-path E2E tests.
     icon: 🐳
 ---
 

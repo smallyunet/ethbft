@@ -2,8 +2,6 @@ package bridge
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -17,11 +15,13 @@ import (
 	abciserver "github.com/cometbft/cometbft/abci/server"
 	abcitypes "github.com/cometbft/cometbft/abci/types"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/smallyunet/ethbft/pkg/config"
+	"github.com/smallyunet/ethbft/pkg/protocol"
 )
 
 var (
@@ -31,7 +31,7 @@ var (
 	})
 	txsBridged = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "ethbft_txs_bridged_total",
-		Help: "Total number of transactions bridged to Geth",
+		Help: "Total number of transactions committed in BFT-validated execution payloads",
 	})
 	rpcErrors = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "ethbft_rpc_errors_total",
@@ -69,6 +69,9 @@ func validateTransaction(raw []byte, chainID *big.Int) (uint32, string) {
 	if len(raw) > 128*1024 {
 		return 1, "tx too large"
 	}
+	if protocol.IsEnvelope(raw) {
+		return 6, "reserved EthBFT execution envelope"
+	}
 	var tx types.Transaction
 	if err := tx.UnmarshalBinary(raw); err != nil {
 		return 2, fmt.Sprintf("invalid transaction encoding: %v", err)
@@ -82,20 +85,10 @@ func validateTransaction(raw []byte, chainID *big.Int) (uint32, string) {
 	if _, err := types.Sender(types.LatestSignerForChainID(chainID), &tx); err != nil {
 		return 5, fmt.Sprintf("invalid signature: %v", err)
 	}
-	return abcitypes.CodeTypeOK, "accepted for asynchronous execution"
-}
-
-func nextAppHash(previous []byte, height int64, txs [][]byte) []byte {
-	h := sha256.New()
-	_, _ = h.Write(previous)
-	var heightBytes [8]byte
-	binary.BigEndian.PutUint64(heightBytes[:], uint64(height))
-	_, _ = h.Write(heightBytes[:])
-	for _, tx := range txs {
-		txHash := sha256.Sum256(tx)
-		_, _ = h.Write(txHash[:])
+	if tx.Type() > types.DynamicFeeTxType {
+		return 7, fmt.Sprintf("transaction type %d is not supported by Engine API V2", tx.Type())
 	}
-	return h.Sum(nil)
+	return abcitypes.CodeTypeOK, "accepted into the EthBFT transaction mempool"
 }
 
 // ABCIApplication implements minimal CometBFT ABCI to drive heights.
@@ -144,55 +137,53 @@ func (app *ABCIApplication) InitChain(ctx context.Context, req *abcitypes.Reques
 }
 
 func (app *ABCIApplication) PrepareProposal(ctx context.Context, req *abcitypes.RequestPrepareProposal) (*abcitypes.ResponsePrepareProposal, error) {
-	valid := make([][]byte, 0, len(req.Txs))
-	for _, tx := range req.Txs {
-		if code, _ := validateTransaction(tx, app.bridge.chainID); code == abcitypes.CodeTypeOK {
-			valid = append(valid, tx)
-		}
+	app.bridge.consensusMu.Lock()
+	defer app.bridge.consensusMu.Unlock()
+	start := time.Now()
+	proposal, err := app.bridge.buildExecutionProposal(req.Height, req.Time, req.Txs, req.MaxTxBytes)
+	observeProposalValidation(start, err)
+	if err != nil {
+		app.logger.Error("Could not build execution proposal", "height", req.Height, "error", err)
+		// Returning an empty proposal keeps the ABCI connection alive. Peers will
+		// reject it in ProcessProposal and CometBFT can move to the next proposer.
+		return &abcitypes.ResponsePrepareProposal{}, nil
 	}
-	return &abcitypes.ResponsePrepareProposal{Txs: valid}, nil
+	app.logger.Info("Built execution proposal", "height", req.Height, "transactions", len(proposal)-1)
+	return &abcitypes.ResponsePrepareProposal{Txs: proposal}, nil
 }
 
 func (app *ABCIApplication) ProcessProposal(ctx context.Context, req *abcitypes.RequestProcessProposal) (*abcitypes.ResponseProcessProposal, error) {
-	for _, tx := range req.Txs {
-		if code, _ := validateTransaction(tx, app.bridge.chainID); code != abcitypes.CodeTypeOK {
-			return &abcitypes.ResponseProcessProposal{Status: abcitypes.ResponseProcessProposal_REJECT}, nil
-		}
+	app.bridge.consensusMu.Lock()
+	defer app.bridge.consensusMu.Unlock()
+	start := time.Now()
+	validationCtx, cancel := context.WithTimeout(ctx, app.bridge.operationTimeout())
+	defer cancel()
+	_, err := app.bridge.validateExecutionProposal(validationCtx, req.Height, req.Time, req.Txs)
+	observeProposalValidation(start, err)
+	if err != nil {
+		app.logger.Warn("Rejected execution proposal", "height", req.Height, "error", err)
+		return &abcitypes.ResponseProcessProposal{Status: abcitypes.ResponseProcessProposal_REJECT}, nil
 	}
 	return &abcitypes.ResponseProcessProposal{Status: abcitypes.ResponseProcessProposal_ACCEPT}, nil
 }
 
 func (app *ABCIApplication) FinalizeBlock(ctx context.Context, req *abcitypes.RequestFinalizeBlock) (*abcitypes.ResponseFinalizeBlock, error) {
-	// Capture transactions and store them in the pool for the bridge to pick up.
-	currentHeight.Set(float64(req.Height))
-	previousPending, previousDeliveries := app.bridge.txPool.Snapshot()
-	if len(req.Txs) > 0 {
-		app.logger.Info("ABCI FinalizeBlock received txs", "height", req.Height, "count", len(req.Txs))
-		if err := app.bridge.txPool.AddTxs(req.Height, req.Txs); err != nil {
-			return nil, err
-		}
-		txsBridged.Add(float64(len(req.Txs)))
-	}
+	app.bridge.consensusMu.Lock()
+	defer app.bridge.consensusMu.Unlock()
 
+	pending, err := app.bridge.stageExecutionCommit(req.Height, req.Time, req.Txs)
+	if err != nil {
+		return nil, fmt.Errorf("stage decided execution payload: %w", err)
+	}
 	txResults := make([]*abcitypes.ExecTxResult, len(req.Txs))
-	for i, tx := range req.Txs {
-		txResults[i] = &abcitypes.ExecTxResult{Code: abcitypes.CodeTypeOK, Data: tx, Log: "accepted for asynchronous execution"}
+	if len(txResults) > 0 {
+		txResults[0] = &abcitypes.ExecTxResult{Code: abcitypes.CodeTypeOK, Log: "execution payload metadata committed"}
 	}
-	previousHeight := app.bridge.abciLastBlockHeight.Load()
-	previousHash := app.bridge.appHash()
-	appHash := []byte{}
-	if !app.bridge.legacyEmptyAppHash.Load() {
-		appHash = nextAppHash(previousHash, req.Height, req.Txs)
+	for i, tx := range pending.txs {
+		txResults[i+1] = &abcitypes.ExecTxResult{Code: abcitypes.CodeTypeOK, Data: tx, Log: "executed in BFT-committed payload"}
 	}
-	app.bridge.abciLastBlockHeight.Store(req.Height)
-	app.bridge.setAppHash(appHash)
-	if err := app.bridge.saveState(); err != nil {
-		app.bridge.abciLastBlockHeight.Store(previousHeight)
-		app.bridge.setAppHash(previousHash)
-		app.bridge.txPool.Restore(previousPending, previousDeliveries)
-		return nil, err
-	}
-	return &abcitypes.ResponseFinalizeBlock{TxResults: txResults, AppHash: appHash}, nil
+	app.logger.Info("Finalized execution proposal", "height", req.Height, "block_hash", pending.payload.BlockHash, "transactions", len(pending.txs))
+	return &abcitypes.ResponseFinalizeBlock{TxResults: txResults, AppHash: append([]byte(nil), pending.appHash...)}, nil
 }
 
 func (app *ABCIApplication) ExtendVote(ctx context.Context, req *abcitypes.RequestExtendVote) (*abcitypes.ResponseExtendVote, error) {
@@ -204,7 +195,14 @@ func (app *ABCIApplication) VerifyVoteExtension(ctx context.Context, req *abcity
 }
 
 func (app *ABCIApplication) Commit(ctx context.Context, req *abcitypes.RequestCommit) (*abcitypes.ResponseCommit, error) {
-	// Minimal commit; CometBFT accepts empty app hash for demo purposes.
+	app.bridge.consensusMu.Lock()
+	defer app.bridge.consensusMu.Unlock()
+	if app.bridge.pendingCommit == nil {
+		return nil, fmt.Errorf("no finalized execution payload to commit")
+	}
+	if err := app.bridge.commitPendingExecution(); err != nil {
+		return nil, err
+	}
 	return &abcitypes.ResponseCommit{}, nil
 }
 
@@ -372,11 +370,12 @@ func (s *ABCIServer) Start() error {
 	})
 	mux.HandleFunc("/tx/", func(w http.ResponseWriter, r *http.Request) {
 		hashText := strings.TrimPrefix(r.URL.Path, "/tx/")
-		if len(hashText) != 66 || !strings.HasPrefix(hashText, "0x") {
+		decodedHash, err := hexutil.Decode(hashText)
+		if err != nil || len(decodedHash) != common.HashLength {
 			http.Error(w, "invalid transaction hash", http.StatusBadRequest)
 			return
 		}
-		delivery, ok := s.bridge.txPool.GetDelivery(common.HexToHash(hashText))
+		delivery, ok := s.bridge.txPool.GetDelivery(common.BytesToHash(decodedHash))
 		if !ok {
 			http.Error(w, "transaction delivery status not found", http.StatusNotFound)
 			return
@@ -391,12 +390,11 @@ func (s *ABCIServer) Start() error {
 		Handler:           mux,
 		ReadHeaderTimeout: 3 * time.Second,
 	}
+	ln, err := net.Listen("tcp", s.healthAddr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on health/metrics address %s: %w", s.healthAddr, err)
+	}
 	go func() {
-		ln, err := net.Listen("tcp", s.healthAddr)
-		if err != nil {
-			s.logger.Error("Health/Metrics server listen error", "error", err)
-			return
-		}
 		s.logger.Info("Starting HTTP health/metrics server", "addr", s.healthAddr)
 		if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 			s.logger.Error("Health/Metrics server error", "error", err)
@@ -404,6 +402,7 @@ func (s *ABCIServer) Start() error {
 	}()
 
 	if err := s.srv.Start(); err != nil {
+		_ = s.httpServer.Close()
 		return fmt.Errorf("failed to start ABCI socket server: %w", err)
 	}
 	return nil

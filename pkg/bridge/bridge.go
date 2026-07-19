@@ -16,10 +16,15 @@ import (
 	"github.com/smallyunet/ethbft/pkg/ethereum"
 )
 
+type executionClient interface {
+	Call(context.Context, string, interface{}) (json.RawMessage, error)
+	GetChainID(context.Context) (*big.Int, error)
+}
+
 // Bridge wires CometBFT (consensus) to a Geth execution client via the Engine API.
 type Bridge struct {
 	config     *config.Config
-	ethClient  *ethereum.Client
+	ethClient  executionClient
 	consClient *consensus.Client
 	abciServer *ABCIServer
 	abciApp    *ABCIApplication
@@ -29,15 +34,14 @@ type Bridge struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	wg                  sync.WaitGroup
 	running             bool
 	runningLock         sync.Mutex
+	consensusMu         sync.Mutex
 	lastProducedHeight  atomic.Int64
 	lastProgressUnix    atomic.Int64
 	statePersisted      atomic.Bool
 	stateMu             sync.Mutex
 	abciLastBlockHeight atomic.Int64
-	legacyEmptyAppHash  atomic.Bool
 	appHashMu           sync.RWMutex
 	abciAppHash         []byte
 
@@ -51,6 +55,8 @@ type Bridge struct {
 
 	tsCache map[common.Hash]uint64
 	tsMu    sync.RWMutex
+
+	pendingCommit *pendingExecutionCommit
 }
 
 // NewBridge builds all clients and servers, reads EL genesis hash for initial forkchoice.
@@ -135,6 +141,12 @@ func NewBridge(cfg *config.Config) (*Bridge, error) {
 			return nil, fmt.Errorf("reconcile bridge state: %w", err)
 		}
 	}
+	if height := b.lastProducedHeight.Load(); height > 0 {
+		head := b.getHeightHash(height)
+		if err := b.sendForkchoiceUpdate(head, head, head); err != nil {
+			return nil, fmt.Errorf("restore committed execution forkchoice: %w", err)
+		}
+	}
 
 	b.abciApp = NewABCIApplication(b)
 	b.abciServer = NewABCIServer(b)
@@ -154,13 +166,9 @@ func (b *Bridge) Start() error {
 			return err
 		}
 	}
-	if b.config != nil && b.config.Bridge.EnableBridging {
-		b.wg.Add(1)
-		go b.runBlockBridging()
-	}
 	b.running = true
 	b.lastProgressUnix.Store(time.Now().Unix())
-	b.logger.Info("Bridge started", "bridging_enabled", b.config != nil && b.config.Bridge.EnableBridging)
+	b.logger.Info("Bridge started", "protocol", "execution-payload-consensus-v1")
 	return nil
 }
 
@@ -180,126 +188,6 @@ func (b *Bridge) Stop() error {
 		}
 	}
 	b.cancel()
-	done := make(chan struct{})
-	go func() { b.wg.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		b.logger.Warn("Bridge stop timeout, continuing")
-	}
 	b.running = false
 	return nil
-}
-
-// runBlockBridging polls CometBFT latest height and triggers the Engine API loop.
-func (b *Bridge) runBlockBridging() {
-	defer b.wg.Done()
-	b.logger.Info("Block bridging loop started (Event-Driven)")
-
-	heightCh, err := b.consClient.SubscribeNewBlocks(b.ctx)
-	if err != nil {
-		b.logger.Error("Failed to subscribe to new blocks, falling back to polling", "error", err)
-		b.runPollingLoop()
-		return
-	}
-	defer func() {
-		if err := b.consClient.UnsubscribeAll(context.Background()); err != nil {
-			b.logger.Error("Failed to unsubscribe from all events", "error", err)
-		}
-	}()
-
-	// Resume after the last successfully produced and persisted CometBFT height.
-	// Starting from the current consensus height would skip blocks committed while
-	// the bridge was down, while starting from zero would replay execution blocks.
-	lastHeight := b.lastProducedHeight.Load()
-	retryTicker := time.NewTicker(2 * time.Second)
-	defer retryTicker.Stop()
-
-	for {
-		select {
-		case <-b.ctx.Done():
-			b.logger.Info("Block bridging loop stopped")
-			return
-		case <-retryTicker.C:
-			h, fetchErr := b.fetchCometHeight()
-			if fetchErr != nil {
-				b.logger.Warn("Failed to fetch height for retry", "error", fetchErr)
-				continue
-			}
-			b.processThrough(&lastHeight, h)
-		case h, ok := <-heightCh:
-			if !ok {
-				b.logger.Warn("Subscription channel closed, attempting to reconnect...")
-				time.Sleep(2 * time.Second)
-				heightCh, err = b.consClient.SubscribeNewBlocks(b.ctx)
-				if err != nil {
-					b.logger.Warn("Failed to reconnect subscription, falling back to polling", "error", err)
-					b.runPollingLoop()
-					return
-				}
-				continue
-			}
-			if h <= lastHeight {
-				continue
-			}
-			b.processThrough(&lastHeight, h)
-		}
-	}
-}
-
-func (b *Bridge) processThrough(lastHeight *int64, target int64) {
-	for height := *lastHeight + 1; height <= target; height++ {
-		if err := b.processHeight(height); err != nil {
-			b.logger.Error("Failed to process height", "height", height, "error", err)
-			return
-		}
-		*lastHeight = height
-		b.txPool.Prune(height - int64(b.maxHistory))
-	}
-}
-
-func (b *Bridge) runPollingLoop() {
-	b.logger.Info("Starting polling loop fallback")
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	lastHeight := b.lastProducedHeight.Load()
-
-	for {
-		select {
-		case <-b.ctx.Done():
-			return
-		case <-ticker.C:
-			currentHeight, err := b.fetchCometHeight()
-			if err != nil {
-				b.logger.Error("Failed to fetch CometBFT height", "error", err)
-				continue
-			}
-
-			if currentHeight <= lastHeight {
-				continue
-			}
-
-			b.processThrough(&lastHeight, currentHeight)
-		}
-	}
-}
-
-func (b *Bridge) fetchCometHeight() (int64, error) {
-	timeout := 5 * time.Second
-	if b.config.Bridge.Timeout > 0 {
-		timeout = time.Duration(b.config.Bridge.Timeout) * time.Second
-	}
-	ctx, cancel := context.WithTimeout(b.ctx, timeout)
-	defer cancel()
-	status, err := b.consClient.GetStatus(ctx)
-	if err != nil {
-		return 0, err
-	}
-	return status.SyncInfo.LatestBlockHeight, nil
-}
-
-// processHeight triggers block production for the given CometBFT height.
-func (b *Bridge) processHeight(height int64) error {
-	return b.produceBlockAtHeight(height)
 }

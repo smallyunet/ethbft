@@ -16,8 +16,7 @@ const (
 	DeliveryRejected = "rejected"
 )
 
-// DeliveryStatus describes asynchronous delivery of a CometBFT transaction to the EL.
-// A successful CometBFT result means accepted; Included is the terminal EL success state.
+// DeliveryStatus records the EL block in which CometBFT committed a transaction.
 type DeliveryStatus struct {
 	TxHash      common.Hash `json:"txHash"`
 	Height      int64       `json:"height"`
@@ -49,7 +48,7 @@ func transactionHash(txBytes []byte) (common.Hash, error) {
 	return tx.Hash(), nil
 }
 
-// AddTxs stores transactions and marks them accepted for asynchronous EL delivery.
+// AddTxs stages transactions while an execution commit is applied atomically.
 func (tp *TxPool) AddTxs(height int64, txs [][]byte) error {
 	tp.mu.Lock()
 	defer tp.mu.Unlock()

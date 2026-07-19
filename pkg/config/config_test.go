@@ -27,3 +27,24 @@ func TestLoadCreatesStateDirectory(t *testing.T) {
 		t.Fatalf("state directory was not created: %v", err)
 	}
 }
+
+func TestValidateExecutionConsensusConfiguration(t *testing.T) {
+	cfg := DefaultConfig()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("default config is invalid: %v", err)
+	}
+	cfg.Bridge.SafeDepth = 1
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected local finality depth to be rejected")
+	}
+	cfg = DefaultConfig()
+	cfg.Bridge.FeeRecipient = "not-an-address"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid fee recipient to be rejected")
+	}
+	cfg = DefaultConfig()
+	cfg.Bridge.EnableBridging = false
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected disabled execution consensus to be rejected")
+	}
+}
