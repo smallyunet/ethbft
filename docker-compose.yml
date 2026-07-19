@@ -68,11 +68,12 @@ services:
     volumes:
       - ./config/docker-config.yaml:/app/config.yaml
       - ./jwt.hex:/app/jwt.hex
+      - ethbft_data:/app/data
     environment:
       - ETHBFT_CONFIG=/app/config.yaml
 
   cometbft:
-    image: cometbft/cometbft:v0.38.17
+    image: cometbft/cometbft:v0.38.19
     container_name: ethbft-cometbft
     restart: unless-stopped
     depends_on:
@@ -118,3 +119,5 @@ services:
     depends_on:
       - prometheus
 
+volumes:
+  ethbft_data:

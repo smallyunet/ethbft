@@ -9,6 +9,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const DefaultAppVersion = "0.0.9"
+
 // Config stores all configuration for the EthBFT application
 type Config struct {
 	// Ethereum execution client configuration
@@ -63,7 +65,7 @@ func DefaultConfig() *Config {
 	cfg.Bridge.FinalizedDepth = 0    // Default to 0 (finalized immediately for demo)
 	cfg.Bridge.StateFile = "ethbft_state.json"
 	cfg.Bridge.HealthAddr = "0.0.0.0:8081"
-	cfg.Bridge.AppVersion = "0.0.7" // Bump version to reflect fixes
+	cfg.Bridge.AppVersion = DefaultAppVersion
 
 	return cfg
 }
@@ -108,6 +110,12 @@ func Load() (*Config, error) {
 
 	if err := os.MkdirAll(cfg.CometBFT.HomeDir, 0755); err != nil {
 		return nil, err
+	}
+
+	if cfg.Bridge.StateFile != "" {
+		if err := os.MkdirAll(filepath.Dir(cfg.Bridge.StateFile), 0755); err != nil {
+			return nil, err
+		}
 	}
 
 	return cfg, nil

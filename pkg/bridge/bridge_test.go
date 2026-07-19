@@ -1,10 +1,15 @@
 package bridge
 
 import (
+	"encoding/json"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/smallyunet/ethbft/pkg/config"
 )
 
 func TestParseCometHash(t *testing.T) {
@@ -45,4 +50,59 @@ func TestHeightCacheSetGet(t *testing.T) {
 		t.Fatalf("heightToHash length exceeded: %d > %d", len(b.heightToHash), b.maxHistory)
 	}
 	b.heightMu.RUnlock()
+}
+
+func TestBridgeProgressError(t *testing.T) {
+	tests := []struct {
+		name           string
+		enabled        bool
+		cometHeight    int64
+		bridgeHeight   int64
+		ethereumHeight uint64
+		wantError      bool
+	}{
+		{name: "disabled", enabled: false, cometHeight: 10, wantError: false},
+		{name: "waiting for consensus", enabled: true, cometHeight: 0, wantError: false},
+		{name: "no execution progress", enabled: true, cometHeight: 10, bridgeHeight: 0, ethereumHeight: 0, wantError: true},
+		{name: "execution client stuck", enabled: true, cometHeight: 10, bridgeHeight: 10, ethereumHeight: 0, wantError: true},
+		{name: "healthy progress", enabled: true, cometHeight: 10, bridgeHeight: 9, ethereumHeight: 9, wantError: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := bridgeProgressError(tt.enabled, tt.cometHeight, tt.bridgeHeight, tt.ethereumHeight)
+			if (got != "") != tt.wantError {
+				t.Fatalf("bridgeProgressError() = %q, wantError %v", got, tt.wantError)
+			}
+		})
+	}
+}
+
+func TestLoadStateRestoresResumeHeight(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	state := map[int64]common.Hash{
+		40: common.HexToHash("0x40"),
+		42: common.HexToHash("0x42"),
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stateFile, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	b := &Bridge{
+		config: &config.Config{},
+		logger: slog.Default(),
+	}
+	b.config.Bridge.StateFile = stateFile
+	b.loadState()
+
+	if got := b.lastProducedHeight.Load(); got != 42 {
+		t.Fatalf("resume height = %d, want 42", got)
+	}
+	if !b.statePersisted.Load() {
+		t.Fatal("loaded state should be marked persisted")
+	}
 }

@@ -55,7 +55,7 @@ generate-jwt:
 create-genesis:
 	mkdir -p ./geth_data
 	@echo "Creating genesis.json file..."
-	@echo '{\n  "config": {\n    "chainId": 1337,\n    "homesteadBlock": 0,\n    "eip150Block": 0,\n    "eip155Block": 0,\n    "eip158Block": 0,\n    "byzantiumBlock": 0,\n    "constantinopleBlock": 0,\n    "petersburgBlock": 0,\n    "istanbulBlock": 0,\n    "berlinBlock": 0,\n    "londonBlock": 0,\n    "mergeForkBlock": 0,\n    "terminalTotalDifficulty": 0\n  },\n  "alloc": {},\n  "difficulty": "1",\n  "gasLimit": "30000000"\n}' > ./geth_data/genesis.json
+	@echo '{\n  "config": {\n    "chainId": 1337,\n    "homesteadBlock": 0,\n    "eip150Block": 0,\n    "eip155Block": 0,\n    "eip158Block": 0,\n    "byzantiumBlock": 0,\n    "constantinopleBlock": 0,\n    "petersburgBlock": 0,\n    "istanbulBlock": 0,\n    "berlinBlock": 0,\n    "londonBlock": 0,\n    "mergeForkBlock": 0,\n    "terminalTotalDifficulty": 0,\n    "shanghaiTime": 0\n  },\n  "alloc": {},\n  "difficulty": "1",\n  "gasLimit": "30000000"\n}' > ./geth_data/genesis.json
 	@echo "Genesis file created at ./geth_data/genesis.json"
 
 # Start Docker environment

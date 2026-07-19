@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math/big"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -32,9 +33,11 @@ type Bridge struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	wg          sync.WaitGroup
-	running     bool
-	runningLock sync.Mutex
+	wg                 sync.WaitGroup
+	running            bool
+	runningLock        sync.Mutex
+	lastProducedHeight atomic.Int64
+	statePersisted     atomic.Bool
 
 	heightToHash map[int64]common.Hash
 	heightOrder  []int64
@@ -187,10 +190,10 @@ func (b *Bridge) runBlockBridging() {
 		}
 	}()
 
-	var lastHeight int64 = 0
-	if h, err := b.fetchCometHeight(); err == nil {
-		lastHeight = h
-	}
+	// Resume after the last successfully produced and persisted CometBFT height.
+	// Starting from the current consensus height would skip blocks committed while
+	// the bridge was down, while starting from zero would replay execution blocks.
+	lastHeight := b.lastProducedHeight.Load()
 
 	for {
 		select {
@@ -230,10 +233,7 @@ func (b *Bridge) runPollingLoop() {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
-	var lastHeight int64 = 0
-	if h, err := b.fetchCometHeight(); err == nil {
-		lastHeight = h
-	}
+	lastHeight := b.lastProducedHeight.Load()
 
 	for {
 		select {
@@ -279,5 +279,9 @@ func (b *Bridge) fetchCometHeight() (int64, error) {
 
 // processHeight triggers block production for the given CometBFT height.
 func (b *Bridge) processHeight(height int64) error {
-	return b.produceBlockAtHeight(height)
+	if err := b.produceBlockAtHeight(height); err != nil {
+		return err
+	}
+	b.lastProducedHeight.Store(height)
+	return nil
 }

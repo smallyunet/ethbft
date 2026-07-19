@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	abciserver "github.com/cometbft/cometbft/abci/server"
@@ -16,6 +18,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/smallyunet/ethbft/pkg/config"
 )
 
 var (
@@ -46,6 +49,13 @@ var (
 	})
 )
 
+func bridgeProgressError(enabled bool, cometHeight, bridgeHeight int64, ethereumHeight uint64) string {
+	if enabled && cometHeight > 0 && (bridgeHeight == 0 || ethereumHeight == 0) {
+		return "CometBFT is producing blocks but no execution block has been produced"
+	}
+	return ""
+}
+
 // ABCIApplication implements minimal CometBFT ABCI to drive heights.
 type ABCIApplication struct {
 	bridge *Bridge
@@ -60,7 +70,7 @@ func NewABCIApplication(bridge *Bridge) *ABCIApplication {
 }
 
 func (app *ABCIApplication) Info(ctx context.Context, req *abcitypes.RequestInfo) (*abcitypes.ResponseInfo, error) {
-	version := "0.0.8"
+	version := config.DefaultAppVersion
 	if app.bridge.config != nil && app.bridge.config.Bridge.AppVersion != "" {
 		version = app.bridge.config.Bridge.AppVersion
 	}
@@ -232,26 +242,59 @@ func (s *ABCIServer) Start() error {
 		// Check Geth
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		if _, err := s.bridge.ethClient.Call(ctx, "eth_blockNumber", nil); err != nil {
+		ethBlockRaw, err := s.bridge.ethClient.Call(ctx, "eth_blockNumber", nil)
+		var ethereumHeight uint64
+		if err != nil {
 			status = http.StatusServiceUnavailable
 			response["status"] = "error"
 			response["ethereum_error"] = err.Error()
 		} else {
 			response["ethereum"] = "connected"
+			var blockHex string
+			if err := json.Unmarshal(ethBlockRaw, &blockHex); err != nil {
+				status = http.StatusServiceUnavailable
+				response["status"] = "error"
+				response["ethereum_error"] = "invalid eth_blockNumber response"
+			} else if ethereumHeight, err = strconv.ParseUint(strings.TrimPrefix(blockHex, "0x"), 16, 64); err != nil {
+				status = http.StatusServiceUnavailable
+				response["status"] = "error"
+				response["ethereum_error"] = "invalid eth_blockNumber value"
+			} else {
+				response["ethereum_height"] = ethereumHeight
+			}
 		}
 
 		// Check CometBFT
 		ctxCons, cancelCons := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancelCons()
-		if status == http.StatusOK { // Only check if still OK or if we want full report? Let's check all.
-			// Re-use status if already error
-		}
-		if _, err := s.bridge.consClient.GetStatus(ctxCons); err != nil {
+		cometStatus, err := s.bridge.consClient.GetStatus(ctxCons)
+		if err != nil {
 			status = http.StatusServiceUnavailable
 			response["status"] = "error"
 			response["cometbft_error"] = err.Error()
 		} else {
 			response["cometbft"] = "connected"
+			response["cometbft_height"] = cometStatus.SyncInfo.LatestBlockHeight
+		}
+
+		bridgeHeight := s.bridge.lastProducedHeight.Load()
+		response["bridge_height"] = bridgeHeight
+		bridgingEnabled := s.bridge.config != nil && s.bridge.config.Bridge.EnableBridging
+		var cometHeight int64
+		if cometStatus != nil {
+			cometHeight = cometStatus.SyncInfo.LatestBlockHeight
+		}
+		if progressErr := bridgeProgressError(bridgingEnabled, cometHeight, bridgeHeight, ethereumHeight); progressErr != "" {
+			status = http.StatusServiceUnavailable
+			response["status"] = "error"
+			response["bridge_error"] = progressErr
+		}
+		statePersisted := s.bridge.statePersisted.Load()
+		response["state_persisted"] = statePersisted
+		if bridgingEnabled && bridgeHeight > 0 && !statePersisted {
+			status = http.StatusServiceUnavailable
+			response["status"] = "error"
+			response["state_error"] = "bridge state has not been persisted"
 		}
 
 		// Also check bridge running state

@@ -43,6 +43,7 @@ func (b *Bridge) saveState() {
 
 	data, err := json.Marshal(b.heightToHash)
 	if err != nil {
+		b.statePersisted.Store(false)
 		b.logger.Error("Failed to marshal state", "error", err)
 		return
 	}
@@ -55,14 +56,18 @@ func (b *Bridge) saveState() {
 	// Atomic write: write to temp file then rename
 	tmpPath := path + ".tmp"
 	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		b.statePersisted.Store(false)
 		b.logger.Error("Failed to write temp state file", "error", err)
 		return
 	}
 
 	if err := os.Rename(tmpPath, path); err != nil {
+		b.statePersisted.Store(false)
 		b.logger.Error("Failed to rename temp state file", "error", err)
 		_ = os.Remove(tmpPath)
+		return
 	}
+	b.statePersisted.Store(true)
 }
 
 func (b *Bridge) loadState() {
@@ -97,5 +102,9 @@ func (b *Bridge) loadState() {
 	sort.Slice(b.heightOrder, func(i, j int) bool {
 		return b.heightOrder[i] < b.heightOrder[j]
 	})
+	if len(b.heightOrder) > 0 {
+		b.lastProducedHeight.Store(b.heightOrder[len(b.heightOrder)-1])
+	}
+	b.statePersisted.Store(true)
 	b.logger.Info("Loaded state", "entries", len(m))
 }

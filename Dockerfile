@@ -31,6 +31,7 @@ COPY config/docker-config.yaml /app/config.yaml
 
 # Create a non-root user
 RUN adduser -D -g '' ethbft
+RUN mkdir -p /app/data
 RUN chown -R ethbft:ethbft /app
 USER ethbft
 

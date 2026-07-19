@@ -277,13 +277,13 @@ func (b *Bridge) produceBlockAtHeight(height int64) (err error) {
 	includedTxs := len(payload.Transactions)
 	expectedTxs := len(txs)
 	if expectedTxs > 0 {
-		// Basic count check (since we don't easily have hash of EL txs here without decoding 
-		// the payload txs, which is expensive, but for v0.0.8 this is a good start)
+		// Basic count check (since we don't easily have hash of EL txs here without decoding
+		// the payload txs, which is expensive, but for v0.0.9 this is a good start)
 		if includedTxs < expectedTxs {
-			b.logger.Warn("Transactions missing from block", 
-				"height", height, 
-				"expected", expectedTxs, 
-				"included", includedTxs, 
+			b.logger.Warn("Transactions missing from block",
+				"height", height,
+				"expected", expectedTxs,
+				"included", includedTxs,
 				"missing_count", expectedTxs-includedTxs)
 		} else {
 			b.logger.Info("Block produced with expected transactions",
