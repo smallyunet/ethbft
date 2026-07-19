@@ -15,7 +15,7 @@ fi
 
 exec cometbft start \
   --home=/cometbft \
-  --log_level=debug \
+  --log_level=info \
   --abci=socket \
   --proxy_app=tcp://ethbft:8080 \
   --rpc.laddr=tcp://0.0.0.0:26657 \

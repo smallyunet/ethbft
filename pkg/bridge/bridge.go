@@ -16,10 +16,6 @@ import (
 	"github.com/smallyunet/ethbft/pkg/ethereum"
 )
 
-const (
-	pruneDepth = 100
-)
-
 // Bridge wires CometBFT (consensus) to a Geth execution client via the Engine API.
 type Bridge struct {
 	config     *config.Config
@@ -33,11 +29,17 @@ type Bridge struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	wg                 sync.WaitGroup
-	running            bool
-	runningLock        sync.Mutex
-	lastProducedHeight atomic.Int64
-	statePersisted     atomic.Bool
+	wg                  sync.WaitGroup
+	running             bool
+	runningLock         sync.Mutex
+	lastProducedHeight  atomic.Int64
+	lastProgressUnix    atomic.Int64
+	statePersisted      atomic.Bool
+	stateMu             sync.Mutex
+	abciLastBlockHeight atomic.Int64
+	legacyEmptyAppHash  atomic.Bool
+	appHashMu           sync.RWMutex
+	abciAppHash         []byte
 
 	heightToHash map[int64]common.Hash
 	heightOrder  []int64
@@ -95,11 +97,6 @@ func NewBridge(cfg *config.Config) (*Bridge, error) {
 		b.logger.Info("Connected to Ethereum", "chainID", cid.String())
 	}
 
-	b.loadState()
-
-	b.abciApp = NewABCIApplication(b)
-	b.abciServer = NewABCIServer(b)
-
 	// Try to read EL genesis hash
 	{
 		timeout := 5 * time.Second
@@ -121,6 +118,26 @@ func NewBridge(cfg *config.Config) (*Bridge, error) {
 			b.logger.Warn("Failed to fetch EL genesis hash", "error", err)
 		}
 	}
+	if b.elGenesis == (common.Hash{}) {
+		return nil, fmt.Errorf("failed to determine execution genesis hash")
+	}
+	if err := b.loadState(); err != nil {
+		return nil, fmt.Errorf("load bridge state: %w", err)
+	}
+	{
+		timeout := 5 * time.Second
+		if cfg.Bridge.Timeout > 0 {
+			timeout = time.Duration(cfg.Bridge.Timeout) * time.Second
+		}
+		ctx2, cancel2 := context.WithTimeout(ctx, timeout)
+		defer cancel2()
+		if err := b.reconcileState(ctx2); err != nil {
+			return nil, fmt.Errorf("reconcile bridge state: %w", err)
+		}
+	}
+
+	b.abciApp = NewABCIApplication(b)
+	b.abciServer = NewABCIServer(b)
 
 	return b, nil
 }
@@ -142,6 +159,7 @@ func (b *Bridge) Start() error {
 		go b.runBlockBridging()
 	}
 	b.running = true
+	b.lastProgressUnix.Store(time.Now().Unix())
 	b.logger.Info("Bridge started", "bridging_enabled", b.config != nil && b.config.Bridge.EnableBridging)
 	return nil
 }
@@ -194,12 +212,21 @@ func (b *Bridge) runBlockBridging() {
 	// Starting from the current consensus height would skip blocks committed while
 	// the bridge was down, while starting from zero would replay execution blocks.
 	lastHeight := b.lastProducedHeight.Load()
+	retryTicker := time.NewTicker(2 * time.Second)
+	defer retryTicker.Stop()
 
 	for {
 		select {
 		case <-b.ctx.Done():
 			b.logger.Info("Block bridging loop stopped")
 			return
+		case <-retryTicker.C:
+			h, fetchErr := b.fetchCometHeight()
+			if fetchErr != nil {
+				b.logger.Warn("Failed to fetch height for retry", "error", fetchErr)
+				continue
+			}
+			b.processThrough(&lastHeight, h)
 		case h, ok := <-heightCh:
 			if !ok {
 				b.logger.Warn("Subscription channel closed, attempting to reconnect...")
@@ -215,16 +242,19 @@ func (b *Bridge) runBlockBridging() {
 			if h <= lastHeight {
 				continue
 			}
-			for i := lastHeight + 1; i <= h; i++ {
-				if err := b.processHeight(i); err != nil {
-					b.logger.Error("Failed to process height", "height", i, "error", err)
-					break
-				} else {
-					lastHeight = i
-					b.txPool.Prune(i - pruneDepth)
-				}
-			}
+			b.processThrough(&lastHeight, h)
 		}
+	}
+}
+
+func (b *Bridge) processThrough(lastHeight *int64, target int64) {
+	for height := *lastHeight + 1; height <= target; height++ {
+		if err := b.processHeight(height); err != nil {
+			b.logger.Error("Failed to process height", "height", height, "error", err)
+			return
+		}
+		*lastHeight = height
+		b.txPool.Prune(height - int64(b.maxHistory))
 	}
 }
 
@@ -250,15 +280,7 @@ func (b *Bridge) runPollingLoop() {
 				continue
 			}
 
-			for h := lastHeight + 1; h <= currentHeight; h++ {
-				if err := b.processHeight(h); err != nil {
-					b.logger.Error("Failed to process height", "height", h, "error", err)
-					break
-				} else {
-					lastHeight = h
-					b.txPool.Prune(h - pruneDepth)
-				}
-			}
+			b.processThrough(&lastHeight, currentHeight)
 		}
 	}
 }
@@ -279,9 +301,5 @@ func (b *Bridge) fetchCometHeight() (int64, error) {
 
 // processHeight triggers block production for the given CometBFT height.
 func (b *Bridge) processHeight(height int64) error {
-	if err := b.produceBlockAtHeight(height); err != nil {
-		return err
-	}
-	b.lastProducedHeight.Store(height)
-	return nil
+	return b.produceBlockAtHeight(height)
 }

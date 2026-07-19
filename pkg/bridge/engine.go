@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -15,6 +14,75 @@ import (
 )
 
 func zeroHash() common.Hash { return common.Hash{} }
+
+func (b *Bridge) finalityHashes(head common.Hash, height int64) (common.Hash, common.Hash) {
+	hashAtDepth := func(depth int) common.Hash {
+		if depth <= 0 {
+			return head
+		}
+		target := height - int64(depth)
+		if target <= 0 {
+			return b.elGenesis
+		}
+		if hash := b.getHeightHash(target); hash != (common.Hash{}) {
+			return hash
+		}
+		return b.elGenesis
+	}
+	safeDepth := b.config.Bridge.SafeDepth
+	finalizedDepth := b.config.Bridge.FinalizedDepth
+	if b.config.Bridge.FinalityDepth > 0 {
+		if safeDepth == 0 {
+			safeDepth = b.config.Bridge.FinalityDepth
+		}
+		if finalizedDepth == 0 {
+			finalizedDepth = b.config.Bridge.FinalityDepth
+		}
+	}
+	return hashAtDepth(safeDepth), hashAtDepth(finalizedDepth)
+}
+
+func missingTransactionHashes(expected, included [][]byte) ([]common.Hash, error) {
+	includedHashes := make(map[common.Hash]struct{}, len(included))
+	for _, raw := range included {
+		hash, err := transactionHash(raw)
+		if err != nil {
+			return nil, fmt.Errorf("decode payload transaction: %w", err)
+		}
+		includedHashes[hash] = struct{}{}
+	}
+	missing := make([]common.Hash, 0)
+	for _, raw := range expected {
+		hash, err := transactionHash(raw)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := includedHashes[hash]; !ok {
+			missing = append(missing, hash)
+		}
+	}
+	return missing, nil
+}
+
+func terminalInjectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	for _, fragment := range []string{
+		"nonce too low",
+		"insufficient funds",
+		"intrinsic gas too low",
+		"exceeds block gas limit",
+		"invalid sender",
+		"transaction type not supported",
+	} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
+}
 
 // getELHead returns the current EL head hash and its timestamp.
 func (b *Bridge) getELHead(ctx context.Context) (common.Hash, uint64, error) {
@@ -103,20 +171,30 @@ func (b *Bridge) produceBlockAtHeight(height int64) (err error) {
 		ctxTx, cancelTx := context.WithTimeout(b.ctx, timeout)
 		defer cancelTx()
 
-		var wg sync.WaitGroup
 		for _, tx := range txs {
-			wg.Add(1)
-			go func(txBytes []byte) {
-				defer wg.Done()
-				txHex := hexutil.Encode(txBytes)
-				_, err := b.ethClient.Call(ctxTx, "eth_sendRawTransaction", []interface{}{txHex})
-				if err != nil {
-					b.logger.Warn("Failed to inject tx", "error", err)
-					txsInjectionFailed.Inc()
+			txHex := hexutil.Encode(tx)
+			_, injectErr := b.ethClient.Call(ctxTx, "eth_sendRawTransaction", []interface{}{txHex})
+			if injectErr != nil && !strings.Contains(strings.ToLower(injectErr.Error()), "already known") {
+				txsInjectionFailed.Inc()
+				if terminalInjectionError(injectErr) {
+					b.txPool.Reject(tx, injectErr)
+					b.logger.Warn("Rejected non-includable transaction", "error", injectErr)
+					continue
 				}
-			}(tx)
+				attempts := b.txPool.MarkRetrying(tx, injectErr)
+				maxAttempts := b.config.Bridge.MaxDeliveryAttempts
+				if maxAttempts > 0 && attempts >= maxAttempts {
+					b.txPool.Reject(tx, fmt.Errorf("delivery retry limit reached after %d attempts: %w", attempts, injectErr))
+					continue
+				}
+				if stateErr := b.saveState(); stateErr != nil {
+					b.logger.Error("Failed to persist transaction retry state", "error", stateErr)
+				}
+				return fmt.Errorf("inject transaction: %w", injectErr)
+			}
+			b.txPool.MarkInjected(tx)
 		}
-		wg.Wait()
+		txs = b.txPool.GetTxs(height)
 	}
 
 	// 1) Choose parent: prefer last height's head; otherwise EL head; otherwise genesis.
@@ -146,8 +224,9 @@ func (b *Bridge) produceBlockAtHeight(height int64) (err error) {
 		return fmt.Errorf("no valid parent available (zero hash); ensure EL is up and has a head")
 	}
 
-	// 2) Pre-forkchoice without attributes
-	if err := b.sendForkchoiceUpdate(parent, parent, parent); err != nil {
+	// 2) Pre-forkchoice without attributes. Preserve configured safe/finalized depths.
+	preSafe, preFinalized := b.finalityHashes(parent, height-1)
+	if err := b.sendForkchoiceUpdate(parent, preSafe, preFinalized); err != nil {
 		return fmt.Errorf("pre-fcu failed: %w", err)
 	}
 
@@ -172,43 +251,8 @@ func (b *Bridge) produceBlockAtHeight(height int64) (err error) {
 	ctx, cancel := context.WithTimeout(b.ctx, timeout)
 	defer cancel()
 
-	safeHash := parent
-	finalizedHash := parent
-
-	// Calculate safe hash
-	safeDepth := b.config.Bridge.SafeDepth
-	// Backward compatibility: if not set, check old FinalityDepth
-	if safeDepth == 0 && b.config.Bridge.FinalityDepth > 0 {
-		safeDepth = b.config.Bridge.FinalityDepth
-	}
-
-	if safeDepth > 0 && height > int64(safeDepth) {
-		h := b.getHeightHash(height - int64(safeDepth))
-		if (h != common.Hash{}) {
-			safeHash = h
-		} else if b.elGenesis != (common.Hash{}) {
-			safeHash = b.elGenesis
-		}
-	}
-
-	// Calculate finalized hash
-	finalizedDepth := b.config.Bridge.FinalizedDepth
-	// Backward compatibility
-	if finalizedDepth == 0 && b.config.Bridge.FinalityDepth > 0 {
-		finalizedDepth = b.config.Bridge.FinalityDepth
-	}
-
-	if finalizedDepth > 0 && height > int64(finalizedDepth) {
-		h := b.getHeightHash(height - int64(finalizedDepth))
-		if (h != common.Hash{}) {
-			finalizedHash = h
-		} else if b.elGenesis != (common.Hash{}) {
-			finalizedHash = b.elGenesis
-		}
-	}
-
 	req := []any{
-		&FCURequest{Head: parent, Safe: safeHash, Finalized: finalizedHash},
+		&FCURequest{Head: parent, Safe: preSafe, Finalized: preFinalized},
 		attrs,
 	}
 	raw, err := b.ethClient.Call(ctx, "engine_forkchoiceUpdatedV2", req)
@@ -270,79 +314,74 @@ func (b *Bridge) produceBlockAtHeight(height int64) (err error) {
 
 	// 7) Final forkchoice
 	head := payload.BlockHash
-	newSafe := head
-	newFinalized := head
-
-	// Check for transaction inclusion
-	includedTxs := len(payload.Transactions)
-	expectedTxs := len(txs)
-	if expectedTxs > 0 {
-		// Basic count check (since we don't easily have hash of EL txs here without decoding
-		// the payload txs, which is expensive, but for v0.0.9 this is a good start)
-		if includedTxs < expectedTxs {
-			b.logger.Warn("Transactions missing from block",
-				"height", height,
-				"expected", expectedTxs,
-				"included", includedTxs,
-				"missing_count", expectedTxs-includedTxs)
-		} else {
-			b.logger.Info("Block produced with expected transactions",
-				"height", height,
-				"expected", expectedTxs,
-				"included", includedTxs)
+	missing, err := missingTransactionHashes(txs, payload.Transactions)
+	if err != nil {
+		return err
+	}
+	if len(missing) > 0 {
+		deliveryErr := fmt.Errorf("payload is missing %d accepted transactions: %v", len(missing), missing)
+		missingSet := make(map[common.Hash]struct{}, len(missing))
+		for _, hash := range missing {
+			missingSet[hash] = struct{}{}
 		}
+		remainingMissing := false
+		for _, tx := range txs {
+			hash, _ := transactionHash(tx)
+			if _, ok := missingSet[hash]; !ok {
+				continue
+			}
+			attempts := b.txPool.MarkRetrying(tx, deliveryErr)
+			maxAttempts := b.config.Bridge.MaxDeliveryAttempts
+			if maxAttempts > 0 && attempts >= maxAttempts {
+				b.txPool.Reject(tx, fmt.Errorf("delivery retry limit reached after %d attempts: %w", attempts, deliveryErr))
+			} else {
+				remainingMissing = true
+			}
+		}
+		if stateErr := b.saveState(); stateErr != nil {
+			b.logger.Error("Failed to persist missing transaction state", "error", stateErr)
+		}
+		if remainingMissing {
+			return deliveryErr
+		}
+		txs = b.txPool.GetTxs(height)
+	}
+	if len(txs) > 0 {
+		b.logger.Info("Block produced with all accepted transactions", "height", height, "expected", len(txs), "included", len(payload.Transactions))
 	} else {
-		b.logger.Info("Produced block", "height", height, "head", head.Hex(), "txs", includedTxs)
+		b.logger.Info("Produced block", "height", height, "head", head.Hex(), "txs", len(payload.Transactions))
 	}
-
-	// Calculate safe hash
-	safeDepth = b.config.Bridge.SafeDepth
-	// Backward compatibility: if not set, check old FinalityDepth
-	if safeDepth == 0 && b.config.Bridge.FinalityDepth > 0 {
-		safeDepth = b.config.Bridge.FinalityDepth
-	}
-
-	if safeDepth > 0 {
-		safeHeight := height - int64(safeDepth)
-		if safeHeight == height {
-			newSafe = head
-		} else {
-			h := b.getHeightHash(safeHeight)
-			if (h != common.Hash{}) {
-				newSafe = h
-			} else if b.elGenesis != (common.Hash{}) {
-				newSafe = b.elGenesis
-			}
-		}
-	}
-
-	// Calculate finalized hash
-	finalizedDepth = b.config.Bridge.FinalizedDepth
-	// Backward compatibility
-	if finalizedDepth == 0 && b.config.Bridge.FinalityDepth > 0 {
-		finalizedDepth = b.config.Bridge.FinalityDepth
-	}
-
-	if finalizedDepth > 0 {
-		finalizedHeight := height - int64(finalizedDepth)
-		if finalizedHeight == height {
-			newFinalized = head
-		} else {
-			h := b.getHeightHash(finalizedHeight)
-			if (h != common.Hash{}) {
-				newFinalized = h
-			} else if b.elGenesis != (common.Hash{}) {
-				newFinalized = b.elGenesis
-			}
-		}
-	}
+	newSafe, newFinalized := b.finalityHashes(head, height)
 
 	if err := b.sendForkchoiceUpdate(head, newSafe, newFinalized); err != nil {
 		return fmt.Errorf("final fcu failed: %w", err)
 	}
 
+	previousHeight := b.lastProducedHeight.Load()
+	previousHash := b.getHeightHash(height)
+	pendingSnapshot, deliverySnapshot := b.txPool.Snapshot()
 	b.setHeightHash(height, head)
-	b.saveState()
+	b.lastProducedHeight.Store(height)
+	b.lastProgressUnix.Store(time.Now().Unix())
+	b.txPool.CompleteHeight(height, head)
+	if err := b.saveState(); err != nil {
+		b.txPool.Restore(pendingSnapshot, deliverySnapshot)
+		b.heightMu.Lock()
+		if previousHash == (common.Hash{}) {
+			delete(b.heightToHash, height)
+			for i, h := range b.heightOrder {
+				if h == height {
+					b.heightOrder = append(b.heightOrder[:i], b.heightOrder[i+1:]...)
+					break
+				}
+			}
+		} else {
+			b.heightToHash[height] = previousHash
+		}
+		b.heightMu.Unlock()
+		b.lastProducedHeight.Store(previousHeight)
+		return err
+	}
 	return nil
 }
 
@@ -375,12 +414,7 @@ func (b *Bridge) sendForkchoiceUpdate(head, safe, finalized common.Hash) error {
 	if err := json.Unmarshal(res, &resp); err != nil {
 		return fmt.Errorf("decode forkchoiceUpdated: %w", err)
 	}
-	if resp.PayloadStatus.Status != "VALID" &&
-		resp.PayloadStatus.Status != "ACCEPTED" {
-		if resp.PayloadStatus.Status == "SYNCING" {
-			b.logger.Warn("Engine is SYNCING during forkchoice update")
-			return nil
-		}
+	if resp.PayloadStatus.Status != "VALID" && resp.PayloadStatus.Status != "ACCEPTED" {
 		return fmt.Errorf("forkchoice status=%s validationError=%s", resp.PayloadStatus.Status, resp.PayloadStatus.ValidationError)
 	}
 	return nil

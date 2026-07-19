@@ -2,9 +2,12 @@ package bridge
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/http"
 	"strconv"
@@ -13,8 +16,8 @@ import (
 
 	abciserver "github.com/cometbft/cometbft/abci/server"
 	abcitypes "github.com/cometbft/cometbft/abci/types"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -49,11 +52,50 @@ var (
 	})
 )
 
-func bridgeProgressError(enabled bool, cometHeight, bridgeHeight int64, ethereumHeight uint64) string {
+func bridgeProgressError(enabled bool, cometHeight, bridgeHeight int64, ethereumHeight uint64, maxLag int64, lastProgress time.Time, stallTimeout time.Duration) string {
 	if enabled && cometHeight > 0 && (bridgeHeight == 0 || ethereumHeight == 0) {
 		return "CometBFT is producing blocks but no execution block has been produced"
 	}
+	if enabled && maxLag > 0 && cometHeight-bridgeHeight > maxLag {
+		return fmt.Sprintf("bridge is %d blocks behind CometBFT (maximum %d)", cometHeight-bridgeHeight, maxLag)
+	}
+	if enabled && cometHeight > bridgeHeight && stallTimeout > 0 && !lastProgress.IsZero() && time.Since(lastProgress) > stallTimeout {
+		return fmt.Sprintf("bridge has made no progress for %s", time.Since(lastProgress).Round(time.Second))
+	}
 	return ""
+}
+
+func validateTransaction(raw []byte, chainID *big.Int) (uint32, string) {
+	if len(raw) > 128*1024 {
+		return 1, "tx too large"
+	}
+	var tx types.Transaction
+	if err := tx.UnmarshalBinary(raw); err != nil {
+		return 2, fmt.Sprintf("invalid transaction encoding: %v", err)
+	}
+	if chainID == nil {
+		return 4, "bridge not initialized: chainID unknown"
+	}
+	if tx.ChainId().Cmp(chainID) != 0 {
+		return 3, fmt.Sprintf("wrong chainID: got %v want %v", tx.ChainId(), chainID)
+	}
+	if _, err := types.Sender(types.LatestSignerForChainID(chainID), &tx); err != nil {
+		return 5, fmt.Sprintf("invalid signature: %v", err)
+	}
+	return abcitypes.CodeTypeOK, "accepted for asynchronous execution"
+}
+
+func nextAppHash(previous []byte, height int64, txs [][]byte) []byte {
+	h := sha256.New()
+	_, _ = h.Write(previous)
+	var heightBytes [8]byte
+	binary.BigEndian.PutUint64(heightBytes[:], uint64(height))
+	_, _ = h.Write(heightBytes[:])
+	for _, tx := range txs {
+		txHash := sha256.Sum256(tx)
+		_, _ = h.Write(txHash[:])
+	}
+	return h.Sum(nil)
 }
 
 // ABCIApplication implements minimal CometBFT ABCI to drive heights.
@@ -79,8 +121,8 @@ func (app *ABCIApplication) Info(ctx context.Context, req *abcitypes.RequestInfo
 		Data:             "ethbft",
 		Version:          version,
 		AppVersion:       1,
-		LastBlockHeight:  0,
-		LastBlockAppHash: []byte{},
+		LastBlockHeight:  app.bridge.abciLastBlockHeight.Load(),
+		LastBlockAppHash: app.bridge.appHash(),
 	}, nil
 }
 
@@ -89,46 +131,11 @@ func (app *ABCIApplication) Query(ctx context.Context, req *abcitypes.RequestQue
 }
 
 func (app *ABCIApplication) CheckTx(ctx context.Context, req *abcitypes.RequestCheckTx) (*abcitypes.ResponseCheckTx, error) {
-	// Basic validation: check size
-	if len(req.Tx) > 128*1024 { // 128KB limit
-		return &abcitypes.ResponseCheckTx{Code: 1, Log: "tx too large"}, nil
-	}
-
-	// Decode transaction to ensure it is a valid Ethereum transaction
-	var tx types.Transaction
-	if err := rlp.DecodeBytes(req.Tx, &tx); err != nil {
+	code, message := validateTransaction(req.Tx, app.bridge.chainID)
+	if code != abcitypes.CodeTypeOK {
 		txsRejected.Inc()
-		return &abcitypes.ResponseCheckTx{Code: 2, Log: fmt.Sprintf("invalid rlp: %v", err)}, nil
 	}
-
-	// Strict ChainID check
-	if app.bridge.chainID == nil {
-		txsRejected.Inc()
-		return &abcitypes.ResponseCheckTx{
-			Code: 4,
-			Log:  "bridge not initialized: chainID unknown",
-		}, nil
-	}
-
-	if tx.ChainId().Cmp(app.bridge.chainID) != 0 {
-		txsRejected.Inc()
-		return &abcitypes.ResponseCheckTx{
-			Code: 3,
-			Log:  fmt.Sprintf("wrong chainID: got %v want %v", tx.ChainId(), app.bridge.chainID),
-		}, nil
-	}
-
-	// Verify signature
-	signer := types.LatestSignerForChainID(app.bridge.chainID)
-	if _, err := types.Sender(signer, &tx); err != nil {
-		txsRejected.Inc()
-		return &abcitypes.ResponseCheckTx{
-			Code: 5,
-			Log:  fmt.Sprintf("invalid signature: %v", err),
-		}, nil
-	}
-
-	return &abcitypes.ResponseCheckTx{Code: abcitypes.CodeTypeOK}, nil
+	return &abcitypes.ResponseCheckTx{Code: code, Log: message}, nil
 }
 
 func (app *ABCIApplication) InitChain(ctx context.Context, req *abcitypes.RequestInitChain) (*abcitypes.ResponseInitChain, error) {
@@ -137,27 +144,55 @@ func (app *ABCIApplication) InitChain(ctx context.Context, req *abcitypes.Reques
 }
 
 func (app *ABCIApplication) PrepareProposal(ctx context.Context, req *abcitypes.RequestPrepareProposal) (*abcitypes.ResponsePrepareProposal, error) {
-	return &abcitypes.ResponsePrepareProposal{Txs: req.Txs}, nil
+	valid := make([][]byte, 0, len(req.Txs))
+	for _, tx := range req.Txs {
+		if code, _ := validateTransaction(tx, app.bridge.chainID); code == abcitypes.CodeTypeOK {
+			valid = append(valid, tx)
+		}
+	}
+	return &abcitypes.ResponsePrepareProposal{Txs: valid}, nil
 }
 
 func (app *ABCIApplication) ProcessProposal(ctx context.Context, req *abcitypes.RequestProcessProposal) (*abcitypes.ResponseProcessProposal, error) {
+	for _, tx := range req.Txs {
+		if code, _ := validateTransaction(tx, app.bridge.chainID); code != abcitypes.CodeTypeOK {
+			return &abcitypes.ResponseProcessProposal{Status: abcitypes.ResponseProcessProposal_REJECT}, nil
+		}
+	}
 	return &abcitypes.ResponseProcessProposal{Status: abcitypes.ResponseProcessProposal_ACCEPT}, nil
 }
 
 func (app *ABCIApplication) FinalizeBlock(ctx context.Context, req *abcitypes.RequestFinalizeBlock) (*abcitypes.ResponseFinalizeBlock, error) {
 	// Capture transactions and store them in the pool for the bridge to pick up.
 	currentHeight.Set(float64(req.Height))
+	previousPending, previousDeliveries := app.bridge.txPool.Snapshot()
 	if len(req.Txs) > 0 {
 		app.logger.Info("ABCI FinalizeBlock received txs", "height", req.Height, "count", len(req.Txs))
-		app.bridge.txPool.AddTxs(req.Height, req.Txs)
+		if err := app.bridge.txPool.AddTxs(req.Height, req.Txs); err != nil {
+			return nil, err
+		}
 		txsBridged.Add(float64(len(req.Txs)))
 	}
 
 	txResults := make([]*abcitypes.ExecTxResult, len(req.Txs))
 	for i, tx := range req.Txs {
-		txResults[i] = &abcitypes.ExecTxResult{Code: abcitypes.CodeTypeOK, Data: tx}
+		txResults[i] = &abcitypes.ExecTxResult{Code: abcitypes.CodeTypeOK, Data: tx, Log: "accepted for asynchronous execution"}
 	}
-	return &abcitypes.ResponseFinalizeBlock{TxResults: txResults}, nil
+	previousHeight := app.bridge.abciLastBlockHeight.Load()
+	previousHash := app.bridge.appHash()
+	appHash := []byte{}
+	if !app.bridge.legacyEmptyAppHash.Load() {
+		appHash = nextAppHash(previousHash, req.Height, req.Txs)
+	}
+	app.bridge.abciLastBlockHeight.Store(req.Height)
+	app.bridge.setAppHash(appHash)
+	if err := app.bridge.saveState(); err != nil {
+		app.bridge.abciLastBlockHeight.Store(previousHeight)
+		app.bridge.setAppHash(previousHash)
+		app.bridge.txPool.Restore(previousPending, previousDeliveries)
+		return nil, err
+	}
+	return &abcitypes.ResponseFinalizeBlock{TxResults: txResults, AppHash: appHash}, nil
 }
 
 func (app *ABCIApplication) ExtendVote(ctx context.Context, req *abcitypes.RequestExtendVote) (*abcitypes.ResponseExtendVote, error) {
@@ -234,6 +269,10 @@ func (s *ABCIServer) Start() error {
 
 	// Health HTTP server
 	mux := http.NewServeMux()
+	mux.HandleFunc("/live", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("{\"status\":\"ok\"}\n"))
+	})
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		status := http.StatusOK
 		response := make(map[string]any)
@@ -284,7 +323,16 @@ func (s *ABCIServer) Start() error {
 		if cometStatus != nil {
 			cometHeight = cometStatus.SyncInfo.LatestBlockHeight
 		}
-		if progressErr := bridgeProgressError(bridgingEnabled, cometHeight, bridgeHeight, ethereumHeight); progressErr != "" {
+		maxLag := s.bridge.config.Bridge.MaxBridgeLag
+		stallTimeout := time.Duration(s.bridge.config.Bridge.StallTimeout) * time.Second
+		lastProgressUnix := s.bridge.lastProgressUnix.Load()
+		var lastProgress time.Time
+		if lastProgressUnix > 0 {
+			lastProgress = time.Unix(lastProgressUnix, 0)
+		}
+		response["bridge_lag"] = cometHeight - bridgeHeight
+		response["last_progress_at"] = lastProgress.UTC().Format(time.RFC3339)
+		if progressErr := bridgeProgressError(bridgingEnabled, cometHeight, bridgeHeight, ethereumHeight, maxLag, lastProgress, stallTimeout); progressErr != "" {
 			status = http.StatusServiceUnavailable
 			response["status"] = "error"
 			response["bridge_error"] = progressErr
@@ -295,6 +343,15 @@ func (s *ABCIServer) Start() error {
 			status = http.StatusServiceUnavailable
 			response["status"] = "error"
 			response["state_error"] = "bridge state has not been persisted"
+		}
+		if bridgingEnabled && bridgeHeight > 0 {
+			ctxReconcile, cancelReconcile := context.WithTimeout(context.Background(), 2*time.Second)
+			if err := s.bridge.reconcileState(ctxReconcile); err != nil {
+				status = http.StatusServiceUnavailable
+				response["status"] = "error"
+				response["state_error"] = err.Error()
+			}
+			cancelReconcile()
 		}
 
 		// Also check bridge running state
@@ -312,6 +369,20 @@ func (s *ABCIServer) Start() error {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		_ = json.NewEncoder(w).Encode(response)
+	})
+	mux.HandleFunc("/tx/", func(w http.ResponseWriter, r *http.Request) {
+		hashText := strings.TrimPrefix(r.URL.Path, "/tx/")
+		if len(hashText) != 66 || !strings.HasPrefix(hashText, "0x") {
+			http.Error(w, "invalid transaction hash", http.StatusBadRequest)
+			return
+		}
+		delivery, ok := s.bridge.txPool.GetDelivery(common.HexToHash(hashText))
+		if !ok {
+			http.Error(w, "transaction delivery status not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(delivery)
 	})
 	mux.Handle("/metrics", promhttp.Handler())
 

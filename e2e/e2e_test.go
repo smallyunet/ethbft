@@ -79,6 +79,14 @@ func TestE2E(t *testing.T) {
 	t.Run("BridgedTransaction", func(t *testing.T) {
 		testBridgedTransaction(t, client)
 	})
+
+	t.Run("RejectedTransactionDoesNotStall", func(t *testing.T) {
+		testRejectedTransactionDoesNotStall(t, client)
+	})
+
+	t.Run("RestartRecovery", func(t *testing.T) {
+		testRestartRecovery(t, rootDir, client)
+	})
 }
 
 func setupEnvironment(t *testing.T) (string, error) {
@@ -157,6 +165,8 @@ cometbft:
 
 bridge:
   listenAddr: "0.0.0.0:8080"
+  healthAddr: "0.0.0.0:8081"
+  stateFile: "/app/data/ethbft_state.json"
   logLevel: "debug"
   retryInterval: 1
   enableBridging: true
@@ -311,7 +321,7 @@ func testSendTransaction(t *testing.T, client *ethclient.Client) {
 	// This test sends directly to Geth, bypassing the bridge logic for ingestion,
 	// but relying on the bridge to produce the block.
 	toAddress := common.HexToAddress("0x70997970C51812dc3A010C7d01b50e0d17dc79C8") // Another test address
-	value := big.NewInt(1000000000000000000)                                     // 1 ETH
+	value := big.NewInt(1000000000000000000)                                       // 1 ETH
 
 	signedTx, _ := createSignedTx(t, client, toAddress, value)
 
@@ -409,6 +419,128 @@ func testBridgedTransaction(t *testing.T, client *ethclient.Client) {
 		t.Errorf("Bridged transaction failed status: %v", receipt.Status)
 	}
 	t.Logf("Bridged transaction mined in block %v", receipt.BlockNumber)
+
+	deliveryURL := "http://localhost:8081/tx/" + signedTx.Hash().Hex()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		resp, err := http.Get(deliveryURL)
+		if err == nil {
+			var delivery struct {
+				Status      string `json:"status"`
+				ELBlockHash string `json:"elBlockHash"`
+			}
+			decodeErr := json.NewDecoder(resp.Body).Decode(&delivery)
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK && decodeErr == nil && delivery.Status == "included" && delivery.ELBlockHash != "" {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("transaction receipt exists but durable delivery status did not become included")
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func testRestartRecovery(t *testing.T, rootDir string, client *ethclient.Client) {
+	before, err := client.BlockNumber(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := getDockerComposeCommand("-f", "docker-compose.yml", "-f", "e2e/docker-compose.override.yml", "up", "-d", "--force-recreate", "--no-deps", "ethbft")
+	cmd.Dir = rootDir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("restart bridge: %v", err)
+	}
+
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		resp, healthErr := http.Get("http://localhost:8081/health")
+		if healthErr == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				after, blockErr := client.BlockNumber(context.Background())
+				if blockErr == nil && after > before {
+					return
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("bridge did not recover and advance after restart; EL height remained at %d", before)
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+func testRejectedTransactionDoesNotStall(t *testing.T, client *ethclient.Client) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	chainID, err := client.NetworkID(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := types.NewTransaction(0, common.HexToAddress("0x8888888888888888888888888888888888888888"), big.NewInt(1), 21_000, big.NewInt(1_000_000_000), nil)
+	signed, err := types.SignTx(tx, types.LatestSignerForChainID(chainID), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var encoded bytes.Buffer
+	if err := signed.EncodeRLP(&encoded); err != nil {
+		t.Fatal(err)
+	}
+	requestBody, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      "1",
+		"method":  "broadcast_tx_sync",
+		"params":  []interface{}{base64.StdEncoding.EncodeToString(encoded.Bytes())},
+	})
+	resp, err := http.Post("http://localhost:26657", "application/json", bytes.NewReader(requestBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var rpcResp struct {
+		Result struct {
+			Code int    `json:"code"`
+			Log  string `json:"log"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rpcResp); err != nil {
+		t.Fatal(err)
+	}
+	if rpcResp.Result.Code != 0 {
+		t.Fatalf("CometBFT rejected syntactically valid transaction: %s", rpcResp.Result.Log)
+	}
+
+	before, err := client.BlockNumber(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		statusResp, statusErr := http.Get("http://localhost:8081/tx/" + signed.Hash().Hex())
+		if statusErr == nil {
+			var delivery struct {
+				Status string `json:"status"`
+			}
+			decodeErr := json.NewDecoder(statusResp.Body).Decode(&delivery)
+			statusResp.Body.Close()
+			if decodeErr == nil && delivery.Status == "rejected" {
+				after, blockErr := client.BlockNumber(context.Background())
+				if blockErr == nil && after > before {
+					return
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("non-includable transaction was not rejected or stalled block production")
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 func waitMinedWithRetry(ctx context.Context, client *ethclient.Client, tx *types.Transaction) (*types.Receipt, error) {
@@ -438,4 +570,3 @@ func getDockerComposeCommand(args ...string) *exec.Cmd {
 	newArgs := append([]string{"compose"}, args...)
 	return exec.Command("docker", newArgs...)
 }
-

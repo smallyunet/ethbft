@@ -11,6 +11,9 @@ bridge:
   listenAddr: "0.0.0.0:8080"
   healthAddr: "0.0.0.0:8081"
   stateFile: "/app/data/ethbft_state.json"
-  appVersion: "0.0.9"
-  logLevel: "debug"
+  appVersion: "0.0.10"
+  maxBridgeLag: 5
+  stallTimeout: 30
+  maxDeliveryAttempts: 10
+  logLevel: "info"
   enableBridging: true

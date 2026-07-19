@@ -1,8 +1,8 @@
 # Introduction
 
-EthBFT is an experimental, lightweight bridge that drives an Ethereum Execution Layer (EL) client (e.g. Geth) using CometBFT block heights as a timing/advancement signal. It focuses on the **Engine API orchestration loop** (forkchoice + payload production) rather than full state / transaction integration. For every new CometBFT height, EthBFT requests the EL to build (currently empty) blocks and advances forkchoice accordingly.
+EthBFT is an experimental, single-sequencer bridge that uses CometBFT to order Ethereum transactions and drives Geth through the Engine API.
 
-> **Status:** Proof‑of‑concept / demo. ABCI logic includes basic transaction validation. Blocks produced by Geth include transactions injected from CometBFT. Expect breaking changes.
+> **Status:** Proof-of-concept / demo. CometBFT success means accepted for asynchronous delivery. It does not mean executed, and this design does not provide multi-validator consensus over EL state.
 
 ## 🚀 Features (Current Scope)
 
@@ -32,5 +32,5 @@ graph LR
 
 1. Poll CometBFT `status` every 2s; detect new `latest_block_height`.
 2. For each new height H: pick parent hash (cached prior EL head or fallback) and run Engine API sequence.
-3. Set head/safe/finalized all to the newly produced block hash (demo simplification).
-4. Cache (H → headHash) for next iteration.
+3. Verify exact transaction-hash inclusion before advancing the EL head.
+4. Persist delivery results, ABCI state, and the H → headHash mapping.

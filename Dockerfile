@@ -1,4 +1,4 @@
-FROM golang:1.24-alpine AS builder
+FROM golang:1.25.12-alpine@sha256:56961d79ea8129efddcc0b8643fd8a5416b4e6228cfd477e3fd61deb2672c587 AS builder
 
 WORKDIR /build
 
@@ -9,7 +9,7 @@ RUN apk add --no-cache gcc musl-dev
 COPY go.mod ./
 # Copy go.sum if it exists
 COPY go.sum* ./
-RUN go mod tidy && go mod download
+RUN go mod download
 
 # Copy source code
 COPY . .
@@ -18,7 +18,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o ethbft ./cmd/ethbft
 
 # Create a minimal production image
-FROM alpine:3.17
+FROM alpine:3.23.3@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659
 
 WORKDIR /app
 

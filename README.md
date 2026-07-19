@@ -1,14 +1,15 @@
 # EthBFT - Ethereum ↔ CometBFT Minimal Bridge
 
-EthBFT is an experimental, lightweight bridge that drives an Ethereum Execution Layer (EL) client (e.g. Geth) using CometBFT block heights as a timing/advancement signal. It focuses on the **Engine API orchestration loop** (forkchoice + payload production) rather than full state / transaction integration. For every new CometBFT height, EthBFT requests the EL to build (currently empty) blocks and advances forkchoice accordingly.
+EthBFT is an experimental, single-sequencer bridge that drives an Ethereum Execution Layer (EL) client using CometBFT block heights as a timing and ordering signal. It focuses on a reliable Engine API orchestration loop and durable asynchronous delivery of CometBFT transactions to Geth.
 
-> Status: Proof‑of‑concept / demo. ABCI logic includes basic transaction validation. Blocks produced by Geth include transactions injected from CometBFT. Expect breaking changes.
+> Status: Proof-of-concept / demo. A successful CometBFT transaction result means accepted for asynchronous EL delivery, not executed. Query `/tx/<ethereum-tx-hash>` for the delivery result. This architecture does not provide multi-validator BFT agreement on Ethereum state or block hashes.
 
 ## 🚀 Features (Current Scope)
 
 - **Engine API Loop**: Implements the minimal sequence: forkchoiceUpdated → getPayload → newPayload → forkchoiceUpdated (final) per CometBFT height.
 - **Height Tracking**: Maintains mapping of CometBFT height → EL head hash to choose parents. Persisted to disk (`ethbft_state.json`).
-- **ABCI Integration**: Implements ABCI methods with transaction validation (RLP decoding & ChainID check) and injection into Geth.
+- **Durable Transaction Delivery**: Persists accepted transactions, retries Geth injection, and advances only after exact transaction-hash inclusion.
+- **ABCI Integration**: Persists ABCI height/app hash and rejects malformed proposals.
 - **Dynamic Parent Selection**: Falls back to EL latest head or genesis if internal map has no parent yet.
 - **Flexible Finality**: Configurable `safeDepth` and `finalizedDepth` to control safe/finalized head lag relative to current head.
 - **JWT (HS256) Auth**: Automatically signs Engine API calls when a JWT secret is provided.
@@ -18,8 +19,8 @@ EthBFT is an experimental, lightweight bridge that drives an Ethereum Execution 
 - **Configurable**: Supports `feeRecipient` and bridging toggle.
 
 ### Not (Yet) Implemented
-- Execution payload construction from CometBFT data (legacy helpers retained but unused)
-- State proofs, validator set management, or multi‑node orchestration
+- BFT consensus over EL block hashes or Ethereum state roots
+- State proofs, validator set management, or multi-node EL orchestration
 
 ## 📁 Project Structure
 
@@ -46,7 +47,7 @@ ethbft/
 
 ## 🛠️ Prerequisites
 
-- Go 1.24+ (tested with 1.24.x)
+- Go 1.25.12+
 - Docker & Docker Compose (recommended path)
 - OpenSSL (for JWT secret generation) or any tool that can produce 32 random bytes hex
 
@@ -168,7 +169,7 @@ ETHEREUM_HOST=geth COMETBFT_HOST=cometbft ETHBFT_CONFIG=./config/docker-config.y
 High‑level data/control flow (current minimal mode):
 
 ```
-CometBFT (height increment) ---> EthBFT loop ---> Engine API (Geth) builds empty block
+CometBFT (ordered txs) ---> durable delivery queue ---> Engine API (Geth)
          ^                         |                       |
          |                         | 1) forkchoiceUpdated  |
          |                         | 2) getPayload         |
@@ -177,10 +178,10 @@ CometBFT (height increment) ---> EthBFT loop ---> Engine API (Geth) builds empty
 ```
 
 Key behaviors:
-1. Poll CometBFT `status` every 2s; detect new `latest_block_height`.
-2. For each new height H: pick parent hash (cached prior EL head or fallback) and run Engine API sequence.
-3. Set head/safe/finalized all to the newly produced block hash (demo simplification).
-4. Cache (H → headHash) for next iteration.
+1. Accept and persist syntactically valid Ethereum transactions ordered by CometBFT.
+2. For each height, inject its pending transactions into Geth and build a payload.
+3. Verify every accepted Ethereum transaction hash is present before advancing forkchoice.
+4. Persist the height mapping, delivery results, ABCI height, and deterministic app hash.
 
 Legacy helpers exist for building synthetic payloads from CometBFT block data but are not used in the current flow.
 
@@ -190,7 +191,7 @@ Compose brings up three services:
 
 | Service | Purpose | Notes |
 |---------|---------|-------|
-| `ethbft-geth` | Geth execution client | Exposes HTTP (8545), WS (8546), Auth (8551) locally. |
+| `ethbft-geth` | Geth execution client | Exposes HTTP (8545) and WS (8546) on loopback; Engine API stays internal. |
 | `ethbft-app`  | EthBFT bridge | Uses mounted `jwt.hex` and `docker-config.yaml`. |
 | `ethbft-cometbft` | CometBFT node | ABCI connects to EthBFT on 8080. |
 
@@ -200,7 +201,6 @@ Compose brings up three services:
 |------|---------|-------------|
 | 8545 | geth | HTTP JSON-RPC |
 | 8546 | geth | WebSocket RPC |
-| 8551 | geth | Engine API (authrpc) |
 | 8080 | ethbft | ABCI socket |
 | 8081 | ethbft | Health check `/health` |
 | 26656 | cometbft | P2P |
@@ -213,6 +213,9 @@ Compose brings up three services:
 ```bash
 # Check bridge health
 curl http://localhost:8081/health
+
+# Query asynchronous EL delivery using the Ethereum transaction hash
+curl http://localhost:8081/tx/0x...
 
 # Check CometBFT status
 curl http://localhost:26657/status
@@ -302,7 +305,7 @@ CGO_ENABLED=0 GOOS=linux go build -o ethbft ./cmd/ethbft
 
 4. **No Blocks Produced**
   - Ensure `enableBridging: true`.
-  - Verify Engine API reachable: curl localhost:8551 (expect method not allowed / JSON error, not connection refused).
+  - Verify the bridge can reach the internal Geth Engine API and that the JWT secrets match.
   - Check JWT secret matches the one Geth was launched with.
 
 5. **Forkchoice Errors in Logs**
@@ -313,8 +316,9 @@ CGO_ENABLED=0 GOOS=linux go build -o ethbft ./cmd/ethbft
 
 ## 🔐 Security Notes
 
-- Do NOT expose the Engine API (authrpc / 8551) to untrusted networks.
-- Current demo runs all components on a single host; multi‑validator / multi‑EL safety not considered.
+- Engine API is intentionally not published to the host; keep it on a private container network.
+- Compose ports bind to loopback by default. Add authentication and an explicit network policy before remote deployment.
+- This single-sequencer demo does not make EL state part of CometBFT consensus and is not a multi-validator BFT chain.
 - JWT tokens are short‑lived (60s) and regenerated per Engine API call.
 
 ## 📝 License

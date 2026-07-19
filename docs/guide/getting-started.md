@@ -2,7 +2,7 @@
 
 ## 🛠️ Prerequisites
 
-- **Go 1.24+** (tested with 1.24.x)
+- **Go 1.25.12+**
 - **Docker & Docker Compose** (recommended path)
 - **OpenSSL** (for JWT secret generation)
 

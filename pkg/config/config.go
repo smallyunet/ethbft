@@ -9,7 +9,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const DefaultAppVersion = "0.0.9"
+const DefaultAppVersion = "0.0.10"
 
 // Config stores all configuration for the EthBFT application
 type Config struct {
@@ -28,17 +28,20 @@ type Config struct {
 
 	// Bridge configuration
 	Bridge struct {
-		ListenAddr     string `yaml:"listenAddr"`     // Address to listen on (e.g., "0.0.0.0:8080")
-		LogLevel       string `yaml:"logLevel"`       // Log level (debug, info, warn, error)
-		EnableBridging bool   `yaml:"enableBridging"` // Whether to enable actual CometBFT->Geth bridging
-		Timeout        int    `yaml:"timeout"`        // Global timeout in seconds for operations
-		FeeRecipient   string `yaml:"feeRecipient"`   // Address to receive block rewards
-		FinalityDepth  int    `yaml:"finalityDepth"`  // Deprecated: use SafeDepth/FinalizedDepth
-		SafeDepth      int    `yaml:"safeDepth"`      // Number of blocks behind head for safe
-		FinalizedDepth int    `yaml:"finalizedDepth"` // Number of blocks behind head for finalized
-		StateFile      string `yaml:"stateFile"`      // Path to state persistence file
-		HealthAddr     string `yaml:"healthAddr"`     // Address for health/metrics server
-		AppVersion     string `yaml:"appVersion"`     // Application version reported to ABCI
+		ListenAddr          string `yaml:"listenAddr"`          // Address to listen on (e.g., "0.0.0.0:8080")
+		LogLevel            string `yaml:"logLevel"`            // Log level (debug, info, warn, error)
+		EnableBridging      bool   `yaml:"enableBridging"`      // Whether to enable actual CometBFT->Geth bridging
+		Timeout             int    `yaml:"timeout"`             // Global timeout in seconds for operations
+		FeeRecipient        string `yaml:"feeRecipient"`        // Address to receive block rewards
+		FinalityDepth       int    `yaml:"finalityDepth"`       // Deprecated: use SafeDepth/FinalizedDepth
+		SafeDepth           int    `yaml:"safeDepth"`           // Number of blocks behind head for safe
+		FinalizedDepth      int    `yaml:"finalizedDepth"`      // Number of blocks behind head for finalized
+		StateFile           string `yaml:"stateFile"`           // Path to state persistence file
+		HealthAddr          string `yaml:"healthAddr"`          // Address for health/metrics server
+		AppVersion          string `yaml:"appVersion"`          // Application version reported to ABCI
+		MaxBridgeLag        int64  `yaml:"maxBridgeLag"`        // Maximum healthy CometBFT-to-bridge height lag
+		StallTimeout        int    `yaml:"stallTimeout"`        // Seconds without bridge progress before unhealthy
+		MaxDeliveryAttempts int    `yaml:"maxDeliveryAttempts"` // Retry limit before a non-includable tx is rejected
 	} `yaml:"bridge"`
 }
 
@@ -66,6 +69,9 @@ func DefaultConfig() *Config {
 	cfg.Bridge.StateFile = "ethbft_state.json"
 	cfg.Bridge.HealthAddr = "0.0.0.0:8081"
 	cfg.Bridge.AppVersion = DefaultAppVersion
+	cfg.Bridge.MaxBridgeLag = 5
+	cfg.Bridge.StallTimeout = 30
+	cfg.Bridge.MaxDeliveryAttempts = 10
 
 	return cfg
 }

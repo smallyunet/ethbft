@@ -16,7 +16,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.24'
+        go-version: '1.25.12'
         cache: true
 
     - name: Verify dependencies
@@ -25,8 +25,17 @@ jobs:
     - name: Build
       run: go build -v ./...
 
-    - name: Run Unit Tests
-      run: go test -v ./pkg/...
+    - name: Run Tests
+      run: go test -v ./...
+
+    - name: Run Vet
+      run: go vet ./...
+
+    - name: Run Race Tests
+      run: go test -race ./pkg/...
+
+    - name: Scan Reachable Go Vulnerabilities
+      run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 
   e2e-test:
     name: E2E Test
@@ -40,7 +49,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.24'
+        go-version: '1.25.12'
         cache: true
 
     - name: Build Docker Images
@@ -49,12 +58,5 @@ jobs:
     - name: Run E2E Tests
       env:
         ETHBFT_E2E: "1"
-        ETHBFT_E2E_NO_BUILD: "1" # We built images in previous step, or let the test build it.
-        # The test code runs `docker-compose up -d --build` if ETHBFT_E2E_NO_BUILD is not 1.
-        # Let's let the test handle the build or pre-build here.
-        # Actually, pre-building is better to see build errors early.
-      run: |
-        # Pre-pull or build to avoid timeouts in test
-        docker compose pull || true
-        docker compose build
-        go test -v -timeout 10m ./e2e/...
+        ETHBFT_E2E_NO_BUILD: "1"
+      run: go test -v -timeout 10m ./e2e/...

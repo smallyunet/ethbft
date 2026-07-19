@@ -1,4 +1,4 @@
-.PHONY: build run clean test test-e2e deploy docker-up docker-down docker-rebuild generate-jwt create-genesis deps
+.PHONY: build run clean test test-e2e test-e2e-fast deploy docker-up docker-down docker-rebuild generate-jwt create-genesis deps
 
 # Project variables
 BINARY_NAME=ethbft
