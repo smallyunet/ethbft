@@ -5,7 +5,7 @@ CometBFT reaches consensus on complete Ethereum execution payloads, while each
 validator uses an independent Geth Engine API to validate the proposed state
 transition.
 
-> **Status: v0.1.0 MVP.** The execution-payload consensus loop is implemented
+> **Status: v0.1.1 MVP.** The execution-payload consensus loop is implemented
 > and covered by a single-validator Docker E2E test. The bundled Compose stack
 > is a development network, not a production multi-validator deployment.
 
@@ -158,7 +158,7 @@ bridge:
   listenAddr: "0.0.0.0:8080"
   healthAddr: "0.0.0.0:8081"
   stateFile: "ethbft_state.json"
-  appVersion: "0.1.0"
+  appVersion: "0.1.1"
   timeout: 10
   logLevel: "info"
   enableBridging: true
@@ -234,7 +234,7 @@ docs/rfc/            consensus protocol specifications
 - Validator EL datadirs must never be shared.
 - A validator whose EL returns `SYNCING`, `ACCEPTED`, times out, or diverges
   rejects the proposal and must be treated as not ready.
-- v0.1.0 has not received an independent security audit.
+- v0.1.1 has not received an independent security audit.
 
 ## Docker Services
 

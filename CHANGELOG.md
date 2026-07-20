@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.1 - 2026-07-20
+
+### Fixed
+
+- Explicitly make Docker E2E bind-mount data directories writable after
+  creation so the non-root EthBFT container can persist committed state on
+  Linux CI runners regardless of the host umask.
+
 ## v0.1.0 - 2026-07-19
 
 ### Added

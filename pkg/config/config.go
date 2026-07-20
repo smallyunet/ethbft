@@ -11,7 +11,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const DefaultAppVersion = "0.1.0"
+const DefaultAppVersion = "0.1.1"
 
 // Config stores all configuration for the EthBFT application
 type Config struct {

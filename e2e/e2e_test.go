@@ -123,15 +123,17 @@ func setupEnvironment(t *testing.T) (string, error) {
 		return "", fmt.Errorf("failed to create data dir: %w", err)
 	}
 
-	// Create subdirectories
-	if err := os.MkdirAll(filepath.Join(dataDir, "geth"), 0777); err != nil {
-		return "", err
-	}
-	if err := os.MkdirAll(filepath.Join(dataDir, "cometbft"), 0777); err != nil {
-		return "", err
-	}
-	if err := os.MkdirAll(filepath.Join(dataDir, "ethbft"), 0777); err != nil {
-		return "", err
+	// Create bind-mount directories and explicitly apply their permissions.
+	// MkdirAll is affected by the host umask (022 on GitHub runners), which
+	// otherwise leaves the non-root ethbft container unable to persist state.
+	for _, name := range []string{"geth", "cometbft", "ethbft"} {
+		path := filepath.Join(dataDir, name)
+		if err := os.MkdirAll(path, 0777); err != nil {
+			return "", err
+		}
+		if err := os.Chmod(path, 0777); err != nil {
+			return "", fmt.Errorf("failed to make %s writable: %w", path, err)
+		}
 	}
 
 	// 1. Generate JWT secret
