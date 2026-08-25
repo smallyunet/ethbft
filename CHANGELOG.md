@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.3.0-alpha.1 - Unreleased
+
+### Changed
+
+- Rebooted the project around protocol v2: one canonical full execution
+  envelope per CometBFT height and no EthBFT/CometBFT user-transaction mempool.
+- Added Engine API capability negotiation and versioned Shanghai V2, Cancun
+  V3, and Prague V4 payload handling.
+- Replaced client-specific dual RPC configuration with one standard
+  JWT-authenticated Engine API endpoint.
+- Reduced durable state to the consensus checkpoint and crash-recoverable
+  commit intent; removed delivery/history indexing.
+- Made observability services optional and removed the default explorer.
+- Added explicit compatibility policy, protocol RFC, security boundary, and
+  production-readiness gates.
+
+### Compatibility
+
+- Protocol v2 and state format 5 require a new chain or an explicit migration.
+- Geth/Shanghai is the current reference integration. Other clients and later
+  fork profiles remain candidates until continuous compatibility tests pass.
+
 ## v0.2.0 - 2026-08-25
 
 ### Changed

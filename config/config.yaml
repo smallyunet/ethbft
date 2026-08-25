@@ -1,19 +1,25 @@
-ethereum:
-  endpoint: "http://localhost:8545"
-  engineAPI: "http://localhost:8551"
+execution:
+  endpoint: "http://localhost:8551"
   jwtSecret: "./jwt.hex"
 
 cometbft:
   endpoint: "http://localhost:26657"
-  homeDir: "./cometbft_home"
 
-bridge:
+# Consensus-critical: every validator must use identical values.
+protocol:
+  shanghaiTime: 0
+  # Set these only when the execution genesis activates the corresponding fork.
+  # cancunTime: 0
+  # pragueTime: 0
+  feeRecipient: "0x0000000000000000000000000000000000000000"
+  maxPayloadBytes: 16777216
+
+node:
   listenAddr: "0.0.0.0:8080"
   healthAddr: "0.0.0.0:8081"
   stateFile: "ethbft_state.json"
-  appVersion: "0.2.0"
-  maxBridgeLag: 5
+  appVersion: "0.3.0-alpha.1"
+  timeout: 10
+  maxConsensusLag: 5
   stallTimeout: 30
   logLevel: "info"
-  enableBridging: true
-  feeRecipient: "0x0000000000000000000000000000000000000000" # Change this to your address

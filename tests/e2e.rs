@@ -1,4 +1,3 @@
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -37,18 +36,13 @@ async fn docker_execution_path() {
     .await;
     assert_eq!(balance.as_str(), Some("0x3635c9adc5dea00000"));
 
-    let raw = hex::decode(RAW_TX).unwrap();
-    let broadcast = rpc(
-        "http://localhost:26657",
-        "broadcast_tx_sync",
-        json!([STANDARD.encode(raw)]),
+    let submitted = rpc(
+        "http://localhost:8545",
+        "eth_sendRawTransaction",
+        json!([format!("0x{RAW_TX}")]),
     )
     .await;
-    assert_eq!(
-        broadcast.get("code").and_then(Value::as_u64),
-        Some(0),
-        "{broadcast}"
-    );
+    assert_eq!(submitted.as_str(), Some(TX_HASH));
 
     wait_until(Duration::from_secs(120), || async {
         rpc_optional(
@@ -61,15 +55,6 @@ async fn docker_execution_path() {
             == Some(json!("0x1"))
     })
     .await;
-    wait_until(Duration::from_secs(30), || async {
-        reqwest::get(format!("http://localhost:8081/tx/{TX_HASH}"))
-            .await
-            .ok()
-            .filter(|r| r.status().is_success())
-            .is_some()
-    })
-    .await;
-
     let before = hex_quantity(&rpc("http://localhost:8545", "eth_blockNumber", json!([])).await);
     compose(
         &root,
@@ -111,20 +96,20 @@ fn prepare(root: &Path) {
     }}"#)).unwrap();
     fs::write(
         data.join("config.yaml"),
-        r#"ethereum:
-  endpoint: "http://ethbft-geth:8545"
-  engineAPI: "http://ethbft-geth:8551"
+        r#"execution:
+  endpoint: "http://ethbft-geth:8551"
   jwtSecret: "/app/jwt.hex"
 cometbft:
   endpoint: "http://ethbft-cometbft:26657"
-  homeDir: "/cometbft"
-bridge:
+protocol:
+  shanghaiTime: 0
+  maxPayloadBytes: 16777216
+node:
   listenAddr: "0.0.0.0:8080"
   healthAddr: "0.0.0.0:8081"
   stateFile: "/app/data/ethbft_state.json"
-  appVersion: "0.2.0"
+  appVersion: "0.3.0-alpha.1"
   logLevel: "debug"
-  enableBridging: true
 "#,
     )
     .unwrap();

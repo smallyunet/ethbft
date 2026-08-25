@@ -1,90 +1,48 @@
 # EthBFT
 
-EthBFT is a thin BFT consensus adapter for Ethereum Execution Layer clients.
-CometBFT reaches consensus on complete Ethereum execution payloads, while each
-validator uses an independent Geth Engine API to validate the proposed state
-transition.
+EthBFT is a lightweight, client-neutral BFT consensus driver for Ethereum
+Execution Layer clients. CometBFT orders one complete execution payload per
+height; each validator independently validates that payload through the
+standard authenticated Engine API.
 
-> **Status: v0.2.0 MVP.** The execution-payload consensus loop is implemented
-> and covered by a single-validator Docker E2E test. The bundled Compose stack
-> is a development network, not a production multi-validator deployment.
+> **Status: v0.3 alpha / pre-production.** Protocol v2 and the Rust runtime are
+> implemented. The included Geth single-validator stack is an integration
+> environment, not evidence that the production acceptance gates have passed.
 
-## What v0.2.0 Implements
-
-- **Payload consensus:** the proposer places deterministic execution metadata
-  and the exact ordered payload transactions in the CometBFT proposal.
-- **Independent validation:** `ProcessProposal` reconstructs the payload,
-  verifies its block hash and consensus fields, and requires the local EL to
-  return `VALID` from `engine_newPayloadV2`.
-- **Commit-after-consensus:** EL forkchoice advances only for a CometBFT-decided
-  proposal. ABCI height and app hash become durable at `Commit`.
-- **Execution commitment:** the ABCI app hash commits to the previous app hash,
-  chain ID, consensus height, EL parent/block hashes, state root, receipts root,
-  and transaction root.
-- **Exact transaction order:** CometBFT proposal order is the order in the
-  Ethereum execution payload.
-- **Crash recovery:** a durable commit-intent journal bridges `FinalizeBlock`,
-  EL forkchoice, and ABCI `Commit`; startup safely resumes interrupted commits
-  and rejects incompatible legacy state.
-- **Deterministic envelope:** protocol-v1 metadata uses canonical RLP with a
-  reserved `ETHBFT\x00\x01` prefix.
-- **Operations:** JSON logs, Prometheus metrics, liveness/readiness checks, and
-  committed transaction lookup.
-
-## MVP Scope and Limitations
-
-Protocol v1 intentionally stays small:
-
-- Engine API V2 and a Shanghai-only execution chain.
-- Empty withdrawals and no blob transactions.
-- One fixed fee recipient configured identically on every validator.
-- Atomic, fsynced state-file and commit-intent persistence rather than a
-  transactional database.
-- No ABCI/EL snapshot state sync.
-- No dynamic validator or protocol-parameter updates.
-- No Ethereum-mainnet bridge, light-client proof, or asset custody protocol.
-- The default Docker stack contains one CometBFT validator and one Geth.
-
-The full target protocol and production acceptance criteria are described in
-[RFC 0001](docs/rfc/0001-execution-payload-consensus.md).
-
-## Consensus Flow
+## Design
 
 ```text
-Ethereum transactions
+wallet / application
         |
+        | eth_sendRawTransaction
         v
-CometBFT proposer -- PrepareProposal --> dedicated Geth builder
-        |                                  |
-        |<-- metadata + ordered payload ---|
+validator EL txpool  <---- EL P2P transaction gossip
         |
+        | Engine API: build / validate / forkchoice
         v
-CometBFT proposal
-        |
-        +--> every validator reconstructs the payload
-        +--> every validator calls engine_newPayloadV2
-        +--> only VALID payloads receive consensus votes
-        |
-        v
-CometBFT decision
-        |
-        +--> forkchoiceUpdatedV2(head = safe = finalized)
-        +--> durable height -> EL block mapping
-        +--> execution-committing ABCI app hash
+      EthBFT  <------ ABCI++ ------>  CometBFT
+   (thin adapter)                    (BFT ordering)
 ```
 
-The proposer may select and order valid transactions. Once included in the
-execution payload, that exact membership and order is agreed by CometBFT.
+- No EthBFT transaction mempool, transaction gossip, receipt index, explorer,
+  database, or embedded EVM.
+- The proposer asks its EL to build a payload from the normal EL txpool.
+- CometBFT decides one canonical RLP `ExecutionEnvelope`, including all raw
+  transactions and fork-specific fields.
+- Validators verify the envelope and accept only an Engine API `VALID` result.
+- Forkchoice advances only after the BFT decision; an fsynced commit intent
+  makes the `FinalizeBlock`/`Commit` boundary recoverable.
+- Startup negotiates Engine API capabilities and fails closed when the
+  configured Shanghai/Cancun/Prague method set is unavailable.
 
-## Quick Start
+The core speaks the specification, not client-specific RPC extensions. Geth is
+the reference integration today; Reth, Nethermind, Besu, and Erigon become
+supported only after their compatibility suites pass continuously.
 
-### Prerequisites
+## Quick start
 
-- Rust 1.91+
-- Docker with Compose
-- OpenSSL
-
-### Start the development chain
+Requirements: Docker with Compose and OpenSSL. Rust is needed only for local
+development.
 
 ```bash
 git clone https://github.com/smallyunet/ethbft.git
@@ -92,158 +50,119 @@ cd ethbft
 make deploy
 ```
 
-When upgrading from v0.0.x, start a new chain because legacy app hashes did not
-commit to Ethereum execution:
+Default endpoints:
+
+| Service | Endpoint |
+| --- | --- |
+| Execution JSON-RPC | `http://localhost:8545` |
+| CometBFT RPC | `http://localhost:26657` |
+| Liveness | `http://localhost:8081/live` |
+| Readiness | `http://localhost:8081/ready` |
+| Runtime status | `http://localhost:8081/status` |
+| Prometheus metrics | `http://localhost:8081/metrics` |
+
+Optional monitoring is not started by default:
 
 ```bash
-docker-compose down -v
-rm -rf geth_data cometbft_home
-make deploy
+docker compose --profile observability up -d
 ```
 
-The removal command deletes the local development chain data. Do not use it for
-a network whose state must be retained.
-
-### Access points
-
-| Endpoint | URL |
-| --- | --- |
-| Geth JSON-RPC | http://localhost:8545 |
-| CometBFT RPC | http://localhost:26657 |
-| EthBFT liveness | http://localhost:8081/live |
-| EthBFT readiness | http://localhost:8081/health |
-| Prometheus metrics | http://localhost:8081/metrics |
-| Prometheus UI | http://localhost:19090 |
-| Grafana | http://localhost:3000 |
-| Explorer | http://localhost:5100 |
-
-The default Grafana credentials are `admin` / `admin` and are suitable only for
-local development.
-
-### Observe the chain
+Submit Ethereum transactions to the EL JSON-RPC endpoint, never to CometBFT:
 
 ```bash
-docker-compose logs -f ethbft cometbft geth
-
-curl http://localhost:8081/health
-
-curl -X POST -H "Content-Type: application/json" \
-  --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+curl -H 'content-type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"eth_sendRawTransaction","params":["0x..."]}' \
   http://localhost:8545
 ```
 
-After a transaction is committed, query its consensus delivery record:
-
-```bash
-curl http://localhost:8081/tx/0xYOUR_ETHEREUM_TRANSACTION_HASH
-```
-
-`included` means the transaction belongs to a CometBFT-decided, EL-validated
-execution payload. Mempool admission alone does not create a delivery record.
-
 ## Configuration
 
-EthBFT loads `config.yaml` or the path in `ETHBFT_CONFIG`.
+EthBFT reads `config.yaml` or `ETHBFT_CONFIG`. All validators must use the same
+`protocol` section, EL chain ID, and EL genesis.
 
 ```yaml
-ethereum:
-  endpoint: "http://localhost:8545"
-  engineAPI: "http://localhost:8551"
+execution:
+  endpoint: "http://localhost:8551"
   jwtSecret: "./jwt.hex"
 
 cometbft:
   endpoint: "http://localhost:26657"
-  homeDir: "./cometbft_home"
 
-bridge:
+protocol:
+  shanghaiTime: 0
+  # cancunTime: 0
+  # pragueTime: 0
+  feeRecipient: "0x0000000000000000000000000000000000000000"
+  maxPayloadBytes: 16777216
+
+node:
   listenAddr: "0.0.0.0:8080"
   healthAddr: "0.0.0.0:8081"
   stateFile: "ethbft_state.json"
-  appVersion: "0.2.0"
   timeout: 10
+  maxConsensusLag: 5
+  stallTimeout: 30
   logLevel: "info"
-  enableBridging: true
-  feeRecipient: "0x0000000000000000000000000000000000000000"
 ```
 
-Protocol v1 rejects non-zero local `safeDepth`, `finalizedDepth`, or
-`finalityDepth`: CometBFT-decided EL blocks are finalized immediately. All
-validators must use the same fee recipient, chain ID, genesis, and fork
-schedule.
+`EXECUTION_HOST` and `COMETBFT_HOST` replace endpoint hosts for containerized
+deployments. `ETHEREUM_HOST` remains a deprecated alias for
+`EXECUTION_HOST`.
 
-Environment overrides:
+## Version and migration boundary
 
-| Variable | Purpose |
-| --- | --- |
-| `ETHBFT_CONFIG` | Configuration file path. |
-| `ETHEREUM_HOST` | Replaces the Ethereum RPC host for containers. |
-| `COMETBFT_HOST` | Replaces the CometBFT RPC host for containers. |
-
-## Manual Development
-
-Run a Shanghai-enabled post-merge Geth with HTTP and authenticated Engine API,
-then run CometBFT with its ABCI proxy pointing to EthBFT:
+Protocol v2 is deliberately incompatible with protocol v1 and state format 4.
+Do not point v0.3 at an existing v0.2 chain or state file. For the disposable
+Compose network, stop it and remove its data before migrating:
 
 ```bash
-make generate-jwt
-make create-genesis
-make build
-
-ETHBFT_CONFIG=./config/config.yaml ./ethbft
-
-cometbft start \
-  --home ./cometbft_home \
-  --abci socket \
-  --proxy_app tcp://127.0.0.1:8080
+docker compose down -v
+# This destroys only the local development network data.
+rm -rf geth_data cometbft_home
+make deploy
 ```
 
-The Docker path is recommended because it initializes Geth and CometBFT in the
-required order.
+Production networks require an explicit genesis/state migration procedure;
+none is supplied by this alpha.
 
-## Development and Verification
+## Production acceptance gates
+
+The architecture is intended for production, but this repository must remain
+labelled pre-production until all of these are evidenced:
+
+- multi-validator Byzantine, restart, network-partition, and crash-recovery
+  tests;
+- Hive-style Engine API conformance plus continuous Geth, Reth, Nethermind,
+  Besu, and Erigon matrices for every enabled fork;
+- snapshot/state-sync or an operational validator replacement procedure;
+- validator-set and protocol-upgrade governance;
+- sustained load, payload-size, latency, disk, and memory benchmarks;
+- threat model, independent security audit, incident runbooks, and reproducible
+  signed releases.
+
+See [RFC 0002](docs/rfc/0002-lightweight-client-neutral-protocol.md), the
+[compatibility policy](docs/compatibility.md), and the
+[production checklist](docs/production-readiness.md).
+
+## Development
 
 ```bash
-make test
-cargo fmt --check
+cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
-
-# Full Docker execution path
 ETHBFT_E2E=1 cargo test --locked --test e2e -- --nocapture
 ```
 
-CI runs formatting, Clippy, unit and integration tests, a release build, and the
-Docker E2E test.
+Rust 1.91 is the minimum supported version. Engine API is private,
+JWT-authenticated, and must have exactly one forkchoice authority. Each
+validator must operate an independent EL and datadir.
 
-## Project Structure
+## Consensus backend
 
-```text
-src/abci.rs          CometBFT ABCI++ v0.38 adapter
-src/node.rs          consensus-neutral execution lifecycle
-src/engine.rs        authenticated Ethereum Engine API transport
-src/protocol.rs      versioned execution proposal encoding
-src/state.rs         commit journal, persistence, and reconciliation
-src/config.rs        local configuration
-tests/e2e.rs         Docker execution-path test
-docs/rfc/            consensus protocol specifications
-```
+CometBFT v0.38 remains the production-track backend because it is mature and
+ABCI++ matches the adapter lifecycle. The Rust core is isolated behind
+`ConsensusApplication`, so a Malachite transport can be added later. Malachite
+and Arc integrations are currently experimental/not implemented and are not
+part of the compatibility claim.
 
-## Security Boundary
-
-- Each production validator must use an independent, dedicated EL.
-- Engine API must remain private and JWT-authenticated.
-- EthBFT must be the only forkchoice authority for its EL.
-- Validator EL datadirs must never be shared.
-- A validator whose EL returns `SYNCING`, `ACCEPTED`, times out, or diverges
-  rejects the proposal and must be treated as not ready.
-- v0.2.0 has not received an independent security audit.
-
-## Docker Services
-
-The development stack contains Geth, EthBFT, CometBFT, Prometheus, Grafana, and
-the Alethio lite explorer. Host-facing ports bind to loopback by default. The
-authenticated Engine API remains internal to the Compose network.
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+Licensed under MIT.

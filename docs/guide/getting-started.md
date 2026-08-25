@@ -1,68 +1,26 @@
-# Getting Started
+# Getting started
 
-## 🛠️ Prerequisites
-
-- **Rust 1.91+**
-- **Docker & Docker Compose** (recommended path)
-- **OpenSSL** (for JWT secret generation)
-
-## ⚡ Quick Start
-
-### Using Docker (Recommended)
-
-The easiest way to get started is using the provided Docker Compose stack.
+The default stack contains only Geth, EthBFT, and CometBFT. Install Docker with
+Compose and OpenSSL, then run:
 
 ```bash
-# Clone the repository
 git clone https://github.com/smallyunet/ethbft.git
 cd ethbft
-
-# Start the complete stack
 make deploy
-
-# View logs
-docker-compose logs -f
+curl http://localhost:8081/ready
 ```
 
-If the machine previously ran v0.0.x, delete the disposable development-chain
-state before starting v0.2.0:
+Send transactions to `http://localhost:8545`. CometBFT transaction broadcast
+is disabled because its mempool is configured as `nop`.
+
+Monitoring is optional:
 
 ```bash
-docker-compose down -v
-rm -rf geth_data cometbft_home
+docker compose --profile observability up -d
 ```
 
-This deliberately destroys the local development chain because v0.0.x app
-hashes did not commit to Ethereum execution.
+For Rust development, install Rust 1.91+ and run `make check`. The full Docker
+path is `make test-e2e`.
 
-### Access Points
-
-After running `make deploy`, the following services are available:
-
-- **Block Explorer (Alethio)**: [http://localhost:5100](http://localhost:5100)
-- **Monitoring (Grafana)**: [http://localhost:3000](http://localhost:3000) (User: `admin`, Pass: `admin`)
-- **Prometheus**: [http://localhost:19090](http://localhost:19090)
-- **Geth RPC**: [http://localhost:8545](http://localhost:8545)
-- **CometBFT RPC**: [http://localhost:26657](http://localhost:26657)
-
-## Manual Setup (Without Docker)
-
-You need three processes: Geth (execution), EthBFT (ABCI/Engine adapter), and
-CometBFT (consensus).
-
-```bash
-# 1. Start Geth with Engine API enabled
-geth \
-  --networkid=1337 --nodiscover --http --http.addr=0.0.0.0 --http.api=eth,net,web3,txpool \
-  --authrpc.addr=0.0.0.0 --authrpc.port=8551 --authrpc.jwtsecret=./jwt.hex --authrpc.vhosts=* \
-  --gcmode=archive --syncmode=full --datadir=./geth_data
-
-# 2. Start CometBFT node
-cometbft start --home ./cometbft_home
-
-# 3. Run EthBFT
-ETHBFT_CONFIG=./config/config.yaml ./ethbft
-```
-
-The bundled configuration supports Engine API V2 on a Shanghai-only chain.
-Blob transactions and later Engine API versions are rejected in protocol v1.
+Protocol v2 cannot reuse v0.2 chain state. Follow the destructive local-only
+migration command in the repository README only for a disposable network.

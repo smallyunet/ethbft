@@ -84,17 +84,8 @@ services:
       - ./cometbft_home:/cometbft
       - ./scripts/start-cometbft.sh:/start-cometbft.sh
 
-  explorer:
-    image: alethio/ethereum-lite-explorer@sha256:1de833711ff9f3ed26987e701c1d12789bcfb1261ead87e1f088b8a0554f9944
-    platform: linux/amd64
-    container_name: ethbft-explorer
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:5100:80"
-    environment:
-      - APP_NODE_URL=http://localhost:8545
-
   prometheus:
+    profiles: ["observability"]
     image: prom/prometheus@sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893
     container_name: ethbft-prometheus
     restart: unless-stopped
@@ -106,6 +97,7 @@ services:
       - --config.file=/etc/prometheus/prometheus.yml
 
   grafana:
+    profiles: ["observability"]
     image: grafana/grafana@sha256:121a7a9ece6dc10b969f1f96eed64b4f07dfac0d0b8abc070f7cb83bbde86f63
     container_name: ethbft-grafana
     restart: unless-stopped

@@ -3,11 +3,8 @@ layout: home
 
 hero:
   name: "EthBFT"
-  text: "BFT Ethereum Execution"
-  tagline: "A thin consensus adapter between CometBFT and the Engine API"
-  image:
-    src: https://vitepress.dev/vitepress-logo-large.png
-    alt: EthBFT Logo
+  text: "Client-neutral BFT execution"
+  tagline: "A lightweight consensus driver between CometBFT and Ethereum Engine API clients"
   actions:
     - theme: brand
       text: Get Started
@@ -21,13 +18,13 @@ features:
     details: CometBFT decides complete, ordered Ethereum execution payloads.
     icon: 🚀
   - title: Independent Validation
-    details: Every validator requires its dedicated Geth to return VALID.
+    details: Every validator requires its independent execution client to return VALID.
     icon: 🔌
   - title: Thin Adapter
-    details: CometBFT handles BFT, Geth handles EVM execution, and EthBFT binds them.
+    details: CometBFT handles BFT, the EL handles EVM and transaction gossip, and EthBFT binds them.
     icon: ⚡
-  - title: MVP Network
-    details: One-command Docker deployment with commit recovery and execution-path E2E tests.
+  - title: Honest Compatibility
+    details: Capability negotiation and evidence-based client support, with explicit production gates.
     icon: 🐳
 ---
 

@@ -8,7 +8,7 @@ use tracing::info;
 async fn main() -> anyhow::Result<()> {
     let config = Config::load().context("load configuration")?;
     tracing_subscriber::fmt()
-        .with_env_filter(config.bridge.log_level.clone())
+        .with_env_filter(config.node.log_level.clone())
         .json()
         .init();
 
@@ -16,11 +16,11 @@ async fn main() -> anyhow::Result<()> {
     let node = Arc::new(Mutex::new(Node::connect(config.clone()).await?));
 
     let abci_node = node.clone();
-    let abci_addr = config.bridge.listen_addr.clone();
+    let abci_addr = config.node.listen_addr.clone();
     let abci_task = tokio::spawn(async move { abci::serve(abci_node, abci_addr).await });
 
     let health_node = node.clone();
-    let health_addr = config.bridge.health_addr.clone();
+    let health_addr = config.node.health_addr.clone();
     let health_task = tokio::spawn(async move { health::serve(health_node, health_addr).await });
 
     tokio::select! {

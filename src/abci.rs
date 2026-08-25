@@ -1,5 +1,4 @@
-use crate::node::{ConsensusExecution, Node};
-use alloy_primitives::Bytes as EthBytes;
+use crate::node::{ConsensusApplication, Node};
 use bytes::Bytes as AbciBytes;
 use futures::{future::BoxFuture, FutureExt};
 use std::{
@@ -39,33 +38,28 @@ impl Service<Request> for EthBftService {
             let mut node = node.lock().await;
             let response = match request {
                 Request::Info(_) => Response::Info(response::Info {
-                    data: "ethbft-rs".into(),
-                    version: node.config.bridge.app_version.clone(),
-                    app_version: 2,
-                    last_block_height: node.state.abci_last_block_height.try_into()?,
-                    last_block_app_hash: node.state.abci_last_app_hash.to_vec().try_into()?,
+                    data: "ethbft-protocol-v2".into(),
+                    version: node.config.node.app_version.clone(),
+                    app_version: 3,
+                    last_block_height: node.state.last_committed_height.try_into()?,
+                    last_block_app_hash: node.state.last_app_hash.to_vec().try_into()?,
                 }),
                 Request::Query(query) => {
                     let mut result = response::Query::default();
-                    if query.path == "/tx" && query.data.len() == 32 {
-                        if let Ok(hash) = alloy_primitives::B256::try_from(query.data.as_ref()) {
-                            if let Some(delivery) = node.delivery(hash) {
-                                result.value = serde_json::to_vec(delivery)?.into();
-                            }
-                        }
+                    if query.path == "/status" {
+                        result.value = serde_json::to_vec(&serde_json::json!({
+                            "protocol":2, "height":node.state.last_committed_height,
+                            "executionBlockHash":node.state.last_execution_hash, "chainId":node.chain_id,
+                        }))?.into();
                     }
                     Response::Query(result)
                 }
-                Request::CheckTx(check) => {
-                    let mut result = response::CheckTx::default();
-                    match node.check_transaction(&check.tx) {
-                        Ok(_) => result.log = "accepted into the EthBFT transaction mempool".into(),
-                        Err(error) => {
-                            node.metrics.txs_rejected.inc();
-                            result.code = Code::Err(NonZeroU32::new(1).expect("non-zero"));
-                            result.log = error.to_string();
-                        }
-                    }
+                Request::CheckTx(_) => {
+                    let result = response::CheckTx {
+                        code: Code::Err(NonZeroU32::new(1).expect("non-zero")),
+                        log: "EthBFT has no transaction mempool; submit transactions to the execution client's JSON-RPC endpoint".into(),
+                        ..Default::default()
+                    };
                     Response::CheckTx(result)
                 }
                 Request::InitChain(init) => {
@@ -75,66 +69,45 @@ impl Service<Request> for EthBftService {
                 Request::PrepareProposal(proposal) => {
                     let height = proposal.height.value();
                     let timestamp = proposal.time.unix_timestamp().try_into()?;
-                    let candidates = proposal.txs.into_iter().map(|tx| EthBytes::from(tx.to_vec())).collect();
-                    match node.build_proposal(height, timestamp, candidates, proposal.max_tx_bytes).await {
-                        Ok(txs) => Response::PrepareProposal(response::PrepareProposal {
-                            txs: txs.into_iter().map(|tx| AbciBytes::copy_from_slice(&tx)).collect(),
-                        }),
-                        Err(error) => {
-                            warn!(height, %error, "failed to build execution proposal");
-                            Response::PrepareProposal(response::PrepareProposal { txs: vec![] })
-                        }
+                    match node.propose(height, timestamp, proposal.max_tx_bytes).await {
+                        Ok(envelope) => Response::PrepareProposal(response::PrepareProposal { txs: vec![AbciBytes::copy_from_slice(&envelope)] }),
+                        Err(error) => { warn!(height, %error, "failed to build execution proposal"); Response::PrepareProposal(response::PrepareProposal { txs: vec![] }) }
                     }
                 }
                 Request::ProcessProposal(proposal) => {
                     let height = proposal.height.value();
                     let timestamp = proposal.time.unix_timestamp().try_into()?;
-                    let txs = proposal.txs.iter().map(|tx| EthBytes::from(tx.to_vec())).collect::<Vec<_>>();
-                    match node.validate_proposal(height, timestamp, &txs).await {
+                    let result = match proposal.txs.as_slice() {
+                        [envelope] => node.validate(height, timestamp, envelope).await,
+                        _ => Err(anyhow::anyhow!("proposal must contain exactly one execution envelope")),
+                    };
+                    match result {
                         Ok(_) => Response::ProcessProposal(response::ProcessProposal::Accept),
-                        Err(error) => {
-                            warn!(height, %error, "rejected execution proposal");
-                            Response::ProcessProposal(response::ProcessProposal::Reject)
-                        }
+                        Err(error) => { warn!(height, %error, "rejected execution proposal"); Response::ProcessProposal(response::ProcessProposal::Reject) }
                     }
                 }
                 Request::FinalizeBlock(block) => {
                     let height = block.height.value();
                     let timestamp = block.time.unix_timestamp().try_into()?;
-                    let proposal = block.txs.iter().map(|tx| EthBytes::from(tx.to_vec())).collect::<Vec<_>>();
-                    let app_hash = node.stage_decision(height, timestamp, &proposal).await?;
-                    let mut tx_results = Vec::with_capacity(block.txs.len());
-                    for (index, tx) in block.txs.iter().enumerate() {
-                        tx_results.push(ExecTxResult {
-                            code: Code::Ok,
-                            data: if index == 0 { AbciBytes::new() } else { tx.clone() },
-                            log: if index == 0 { "execution payload metadata committed".into() } else { "executed in BFT-committed payload".into() },
-                            ..Default::default()
-                        });
-                    }
+                    let envelope = match block.txs.as_slice() {
+                        [envelope] => envelope,
+                        _ => return Err(anyhow::anyhow!("finalized block must contain exactly one execution envelope").into()),
+                    };
+                    let app_hash = node.decide(height, timestamp, envelope).await?;
                     Response::FinalizeBlock(response::FinalizeBlock {
-                        tx_results,
-                        app_hash: app_hash.to_vec().try_into()?,
-                        events: vec![],
-                        validator_updates: vec![],
-                        consensus_param_updates: None,
+                        tx_results: vec![ExecTxResult { code:Code::Ok, log:"execution envelope committed".into(), ..Default::default() }],
+                        app_hash: app_hash.to_vec().try_into()?, events:vec![], validator_updates:vec![], consensus_param_updates:None,
                     })
                 }
-                Request::Commit => {
-                    node.commit()?;
-                    Response::Commit(response::Commit {
-                        data: AbciBytes::new(),
-                        retain_height: 0u32.into(),
-                    })
-                }
-                Request::ExtendVote(_) => Response::ExtendVote(response::ExtendVote { vote_extension: AbciBytes::new() }),
+                Request::Commit => { node.commit()?; Response::Commit(response::Commit { data:AbciBytes::new(), retain_height:0u32.into() }) }
+                Request::ExtendVote(_) => Response::ExtendVote(response::ExtendVote { vote_extension:AbciBytes::new() }),
                 Request::VerifyVoteExtension(_) => Response::VerifyVoteExtension(response::VerifyVoteExtension::Accept),
                 Request::ListSnapshots => Response::ListSnapshots(Default::default()),
                 Request::OfferSnapshot(_) => Response::OfferSnapshot(Default::default()),
                 Request::LoadSnapshotChunk(_) => Response::LoadSnapshotChunk(Default::default()),
                 Request::ApplySnapshotChunk(_) => Response::ApplySnapshotChunk(Default::default()),
                 Request::Flush => Response::Flush,
-                Request::Echo(echo) => Response::Echo(response::Echo { message: echo.message }),
+                Request::Echo(echo) => Response::Echo(response::Echo { message:echo.message }),
             };
             Ok(response)
         }.boxed()
@@ -142,8 +115,7 @@ impl Service<Request> for EthBftService {
 }
 
 pub async fn serve(node: Arc<Mutex<Node>>, listen_addr: String) -> anyhow::Result<()> {
-    let service = EthBftService { node };
-    let (consensus, mempool, snapshot, info) = split::service(service, 8);
+    let (consensus, mempool, snapshot, info) = split::service(EthBftService { node }, 8);
     let server = Server::builder()
         .consensus(consensus)
         .mempool(mempool)

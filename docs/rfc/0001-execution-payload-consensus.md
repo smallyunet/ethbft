@@ -1,5 +1,9 @@
 # RFC 0001: BFT Consensus over Ethereum Execution Payloads
 
+> **Historical:** protocol v1 was implemented by v0.2 and is superseded by
+> [RFC 0002](./0002-lightweight-client-neutral-protocol.md). It remains here to
+> document the old wire format; new networks must not implement it.
+
 - **Status:** Draft
 - **Category:** Consensus
 - **Created:** 2026-07-19

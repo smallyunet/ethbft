@@ -1,15 +1,15 @@
 [package]
 name = "ethbft"
-version = "0.2.0"
+version = "0.3.0-alpha.1"
 edition = "2021"
 rust-version = "1.91"
-description = "A BFT consensus adapter for Ethereum execution-layer clients"
+description = "A lightweight, client-neutral BFT consensus driver for Ethereum execution clients"
 license = "MIT"
 repository = "https://github.com/smallyunet/ethbft"
 
 [dependencies]
 alloy-consensus = { version = "=1.0.42", features = ["k256", "serde"] }
-alloy-eips = { version = "=1.0.42", features = ["serde"] }
+alloy-eips = { version = "=1.0.42", features = ["serde", "sha2"] }
 alloy-primitives = { version = "=1.4.1", features = ["serde", "rlp"] }
 alloy-rlp = { version = "0.3.12", features = ["derive"] }
 alloy-rpc-types-engine = "=1.0.42"

@@ -1,12 +1,10 @@
+use crate::protocol::EngineApiVersion;
 use alloy_primitives::Address;
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use std::{env, fs, path::Path};
 
-fn default_endpoint() -> String {
-    "http://localhost:8545".into()
-}
-fn default_engine_api() -> String {
+fn default_engine_endpoint() -> String {
     "http://localhost:8551".into()
 }
 fn default_jwt() -> String {
@@ -14,9 +12,6 @@ fn default_jwt() -> String {
 }
 fn default_comet_endpoint() -> String {
     "http://localhost:26657".into()
-}
-fn default_comet_home() -> String {
-    "./cometbft_home".into()
 }
 fn default_listen() -> String {
     "0.0.0.0:8080".into()
@@ -36,36 +31,33 @@ fn default_level() -> String {
 fn default_timeout() -> u64 {
     10
 }
-fn default_true() -> bool {
-    true
-}
 fn default_max_lag() -> i64 {
     5
 }
 fn default_stall() -> u64 {
     30
 }
+fn default_max_payload_bytes() -> usize {
+    16 * 1024 * 1024
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct EthereumConfig {
-    #[serde(default = "default_endpoint")]
-    pub endpoint: String,
+pub struct ExecutionConfig {
     #[serde(
-        default = "default_engine_api",
-        rename = "engineAPI",
+        default = "default_engine_endpoint",
+        alias = "engineAPI",
         alias = "engineApi"
     )]
-    pub engine_api: String,
+    pub endpoint: String,
     #[serde(default = "default_jwt")]
     pub jwt_secret: String,
 }
 
-impl Default for EthereumConfig {
+impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
-            endpoint: default_endpoint(),
-            engine_api: default_engine_api(),
+            endpoint: default_engine_endpoint(),
             jwt_secret: default_jwt(),
         }
     }
@@ -76,22 +68,88 @@ impl Default for EthereumConfig {
 pub struct CometConfig {
     #[serde(default = "default_comet_endpoint")]
     pub endpoint: String,
-    #[serde(default = "default_comet_home")]
-    pub home_dir: String,
 }
 
 impl Default for CometConfig {
     fn default() -> Self {
         Self {
             endpoint: default_comet_endpoint(),
-            home_dir: default_comet_home(),
         }
     }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct BridgeConfig {
+pub struct ProtocolConfig {
+    #[serde(default)]
+    pub shanghai_time: u64,
+    #[serde(default)]
+    pub cancun_time: Option<u64>,
+    #[serde(default)]
+    pub prague_time: Option<u64>,
+    #[serde(default)]
+    pub fee_recipient: String,
+    #[serde(default = "default_max_payload_bytes")]
+    pub max_payload_bytes: usize,
+}
+
+impl Default for ProtocolConfig {
+    fn default() -> Self {
+        Self {
+            shanghai_time: 0,
+            cancun_time: None,
+            prague_time: None,
+            fee_recipient: String::new(),
+            max_payload_bytes: default_max_payload_bytes(),
+        }
+    }
+}
+
+impl ProtocolConfig {
+    pub fn engine_version(&self, timestamp: u64) -> anyhow::Result<EngineApiVersion> {
+        if timestamp < self.shanghai_time {
+            bail!("pre-Shanghai execution payloads are not supported");
+        }
+        if self
+            .prague_time
+            .is_some_and(|activation| timestamp >= activation)
+        {
+            return Ok(EngineApiVersion::V4);
+        }
+        if self
+            .cancun_time
+            .is_some_and(|activation| timestamp >= activation)
+        {
+            return Ok(EngineApiVersion::V3);
+        }
+        Ok(EngineApiVersion::V2)
+    }
+
+    pub fn configured_versions(&self) -> Vec<EngineApiVersion> {
+        let mut versions = vec![EngineApiVersion::V2];
+        if self.cancun_time.is_some() {
+            versions.push(EngineApiVersion::V3);
+        }
+        if self.prague_time.is_some() {
+            versions.push(EngineApiVersion::V4);
+        }
+        versions
+    }
+
+    pub fn fee_recipient(&self) -> anyhow::Result<Address> {
+        if self.fee_recipient.trim().is_empty() {
+            Ok(Address::ZERO)
+        } else {
+            self.fee_recipient
+                .parse()
+                .context("parse protocol fee recipient")
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeConfig {
     #[serde(default = "default_listen")]
     pub listen_addr: String,
     #[serde(default = "default_health")]
@@ -104,23 +162,13 @@ pub struct BridgeConfig {
     pub timeout: u64,
     #[serde(default = "default_level")]
     pub log_level: String,
-    #[serde(default = "default_true")]
-    pub enable_bridging: bool,
-    #[serde(default)]
-    pub fee_recipient: String,
-    #[serde(default)]
-    pub finality_depth: u64,
-    #[serde(default)]
-    pub safe_depth: u64,
-    #[serde(default)]
-    pub finalized_depth: u64,
     #[serde(default = "default_max_lag")]
-    pub max_bridge_lag: i64,
+    pub max_consensus_lag: i64,
     #[serde(default = "default_stall")]
     pub stall_timeout: u64,
 }
 
-impl Default for BridgeConfig {
+impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             listen_addr: default_listen(),
@@ -129,12 +177,7 @@ impl Default for BridgeConfig {
             app_version: default_version(),
             timeout: default_timeout(),
             log_level: default_level(),
-            enable_bridging: true,
-            fee_recipient: String::new(),
-            finality_depth: 0,
-            safe_depth: 0,
-            finalized_depth: 0,
-            max_bridge_lag: default_max_lag(),
+            max_consensus_lag: default_max_lag(),
             stall_timeout: default_stall(),
         }
     }
@@ -142,12 +185,14 @@ impl Default for BridgeConfig {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Config {
-    #[serde(default)]
-    pub ethereum: EthereumConfig,
+    #[serde(default, alias = "ethereum")]
+    pub execution: ExecutionConfig,
     #[serde(default)]
     pub cometbft: CometConfig,
     #[serde(default)]
-    pub bridge: BridgeConfig,
+    pub protocol: ProtocolConfig,
+    #[serde(default, alias = "bridge")]
+    pub node: NodeConfig,
 }
 
 impl Config {
@@ -161,9 +206,8 @@ impl Config {
         } else {
             Self::default()
         };
-        if let Ok(host) = env::var("ETHEREUM_HOST") {
-            config.ethereum.endpoint = replace_host(&config.ethereum.endpoint, &host)?;
-            config.ethereum.engine_api = replace_host(&config.ethereum.engine_api, &host)?;
+        if let Ok(host) = env::var("EXECUTION_HOST").or_else(|_| env::var("ETHEREUM_HOST")) {
+            config.execution.endpoint = replace_host(&config.execution.endpoint, &host)?;
         }
         if let Ok(host) = env::var("COMETBFT_HOST") {
             config.cometbft.endpoint = replace_host(&config.cometbft.endpoint, &host)?;
@@ -173,33 +217,41 @@ impl Config {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.ethereum.endpoint.trim().is_empty() || self.ethereum.engine_api.trim().is_empty() {
-            bail!("ethereum endpoint and engineAPI are required");
+        if self.execution.endpoint.trim().is_empty() {
+            bail!("execution endpoint is required");
         }
         if self.cometbft.endpoint.trim().is_empty() {
             bail!("cometbft endpoint is required");
         }
-        if !self.bridge.enable_bridging {
-            bail!("protocol v1 requires enableBridging=true");
+        if self.node.timeout == 0 {
+            bail!("node timeout must be positive");
         }
-        if self.bridge.timeout == 0 {
-            bail!("bridge timeout must be positive");
-        }
-        if self.bridge.finality_depth != 0
-            || self.bridge.safe_depth != 0
-            || self.bridge.finalized_depth != 0
+        if self.protocol.max_payload_bytes == 0
+            || self.protocol.max_payload_bytes > crate::protocol::MAX_ENVELOPE_LEN
         {
-            bail!("protocol v1 finalizes decided blocks immediately; finality depths must be zero");
+            bail!(
+                "protocol maxPayloadBytes must be between 1 and {}",
+                crate::protocol::MAX_ENVELOPE_LEN
+            );
         }
-        if !self.bridge.fee_recipient.trim().is_empty() {
-            self.bridge
-                .fee_recipient
-                .parse::<Address>()
-                .context("invalid bridge feeRecipient")?;
+        if let Some(cancun) = self.protocol.cancun_time {
+            if cancun < self.protocol.shanghai_time {
+                bail!("Cancun activation must not precede Shanghai");
+            }
         }
-        match self.bridge.log_level.to_ascii_lowercase().as_str() {
+        if let Some(prague) = self.protocol.prague_time {
+            let cancun = self
+                .protocol
+                .cancun_time
+                .context("Prague configuration requires Cancun activation")?;
+            if prague < cancun {
+                bail!("Prague activation must not precede Cancun");
+            }
+        }
+        self.protocol.fee_recipient()?;
+        match self.node.log_level.to_ascii_lowercase().as_str() {
             "trace" | "debug" | "info" | "warn" | "error" => {}
-            _ => bail!("invalid bridge logLevel {}", self.bridge.log_level),
+            _ => bail!("invalid node logLevel {}", self.node.log_level),
         }
         Ok(())
     }
@@ -222,18 +274,23 @@ mod tests {
     }
 
     #[test]
-    fn consensus_depths_fail_closed() {
-        let mut config = Config::default();
-        config.bridge.safe_depth = 1;
-        assert!(config.validate().is_err());
+    fn engine_version_follows_fork_schedule() {
+        let protocol = ProtocolConfig {
+            cancun_time: Some(10),
+            prague_time: Some(20),
+            ..Default::default()
+        };
+        assert_eq!(protocol.engine_version(1).unwrap(), EngineApiVersion::V2);
+        assert_eq!(protocol.engine_version(10).unwrap(), EngineApiVersion::V3);
+        assert_eq!(protocol.engine_version(20).unwrap(), EngineApiVersion::V4);
     }
 
     #[test]
-    fn legacy_engine_api_key_is_preserved() {
+    fn legacy_engine_api_key_maps_to_single_endpoint() {
         let config: Config = serde_yaml::from_str(
-            "ethereum:\n  engineAPI: http://execution:8551\nbridge:\n  enableBridging: true\n",
+            "ethereum:\n  engineAPI: http://execution:8551\nbridge:\n  timeout: 10\n",
         )
         .unwrap();
-        assert_eq!(config.ethereum.engine_api, "http://execution:8551");
+        assert_eq!(config.execution.endpoint, "http://execution:8551");
     }
 }

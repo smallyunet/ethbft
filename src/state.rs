@@ -1,37 +1,22 @@
 use alloy_primitives::{Bytes, B256, U256};
-use alloy_rpc_types_engine::ExecutionPayloadV2;
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
 };
 
-pub const STATE_VERSION: u64 = 4;
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct DeliveryStatus {
-    pub tx_hash: B256,
-    pub height: u64,
-    pub status: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub last_error: String,
-    #[serde(default, skip_serializing_if = "B256::is_zero")]
-    pub el_block_hash: B256,
-    #[serde(default)]
-    pub attempts: u64,
-}
+pub const STATE_VERSION: u64 = 5;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommitIntent {
     pub height: u64,
-    pub payload: ExecutionPayloadV2,
+    pub encoded_envelope: Bytes,
     pub app_hash: Bytes,
-    pub transactions: Vec<Bytes>,
+    pub block_hash: B256,
+    pub engine_api_version: u64,
     #[serde(default)]
     pub forkchoice_applied: bool,
 }
@@ -43,40 +28,43 @@ pub struct PersistedState {
     pub protocol_version: u64,
     pub chain_id: U256,
     pub el_genesis: B256,
+    pub protocol_fingerprint: B256,
     #[serde(default)]
-    pub last_produced_height: u64,
+    pub last_committed_height: u64,
     #[serde(default)]
-    pub height_to_hash: BTreeMap<u64, B256>,
+    pub last_execution_hash: B256,
     #[serde(default)]
-    pub deliveries: BTreeMap<B256, DeliveryStatus>,
-    #[serde(default)]
-    pub abci_last_block_height: u64,
-    #[serde(default)]
-    pub abci_last_app_hash: Bytes,
+    pub last_app_hash: Bytes,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_intent: Option<CommitIntent>,
 }
 
 impl PersistedState {
-    pub fn new(chain_id: U256, el_genesis: B256) -> Self {
+    pub fn new(chain_id: U256, el_genesis: B256, protocol_fingerprint: B256) -> Self {
         Self {
             version: STATE_VERSION,
-            protocol_version: crate::protocol::VERSION_V1,
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             chain_id,
             el_genesis,
-            last_produced_height: 0,
-            height_to_hash: BTreeMap::new(),
-            deliveries: BTreeMap::new(),
-            abci_last_block_height: 0,
-            abci_last_app_hash: Bytes::new(),
+            protocol_fingerprint,
+            last_committed_height: 0,
+            last_execution_hash: el_genesis,
+            last_app_hash: Bytes::new(),
             commit_intent: None,
         }
     }
 
-    pub fn validate(&self, chain_id: U256, el_genesis: B256) -> anyhow::Result<()> {
-        if self.version != STATE_VERSION || self.protocol_version != crate::protocol::VERSION_V1 {
+    pub fn validate(
+        &self,
+        chain_id: U256,
+        el_genesis: B256,
+        protocol_fingerprint: B256,
+    ) -> anyhow::Result<()> {
+        if self.version != STATE_VERSION
+            || self.protocol_version != crate::protocol::PROTOCOL_VERSION
+        {
             bail!(
-                "state version {}/protocol {} is incompatible with Rust protocol v1",
+                "state version {}/protocol {} is incompatible with protocol v2",
                 self.version,
                 self.protocol_version
             );
@@ -95,6 +83,12 @@ impl PersistedState {
                 el_genesis
             );
         }
+        if self.protocol_fingerprint != protocol_fingerprint {
+            bail!("local protocol configuration does not match persisted network fingerprint");
+        }
+        if self.last_committed_height == 0 && self.last_execution_hash != el_genesis {
+            bail!("fresh state execution head must equal EL genesis");
+        }
         Ok(())
     }
 }
@@ -109,15 +103,24 @@ impl StateStore {
         Self { path: path.into() }
     }
 
-    pub fn load(&self, chain_id: U256, el_genesis: B256) -> anyhow::Result<PersistedState> {
+    pub fn load(
+        &self,
+        chain_id: U256,
+        el_genesis: B256,
+        protocol_fingerprint: B256,
+    ) -> anyhow::Result<PersistedState> {
         if !self.path.exists() {
-            return Ok(PersistedState::new(chain_id, el_genesis));
+            return Ok(PersistedState::new(
+                chain_id,
+                el_genesis,
+                protocol_fingerprint,
+            ));
         }
         let bytes =
             fs::read(&self.path).with_context(|| format!("read state {}", self.path.display()))?;
         let state: PersistedState = serde_json::from_slice(&bytes)
             .with_context(|| format!("decode state {}", self.path.display()))?;
-        state.validate(chain_id, el_genesis)?;
+        state.validate(chain_id, el_genesis, protocol_fingerprint)?;
         Ok(state)
     }
 
@@ -162,21 +165,25 @@ mod tests {
     fn state_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::new(dir.path().join("state.json"));
-        let mut state = PersistedState::new(U256::from(1337), B256::repeat_byte(1));
-        state.abci_last_block_height = 3;
+        let fingerprint = B256::repeat_byte(9);
+        let mut state = PersistedState::new(U256::from(1337), B256::repeat_byte(1), fingerprint);
+        state.last_committed_height = 3;
+        state.last_execution_hash = B256::repeat_byte(2);
         store.save(&state).unwrap();
         assert_eq!(
             store
-                .load(state.chain_id, state.el_genesis)
+                .load(state.chain_id, state.el_genesis, fingerprint)
                 .unwrap()
-                .abci_last_block_height,
+                .last_committed_height,
             3
         );
     }
 
     #[test]
-    fn wrong_chain_fails_closed() {
-        let state = PersistedState::new(U256::from(1), B256::repeat_byte(1));
-        assert!(state.validate(U256::from(2), B256::repeat_byte(1)).is_err());
+    fn wrong_protocol_fingerprint_fails_closed() {
+        let state = PersistedState::new(U256::from(1), B256::repeat_byte(1), B256::repeat_byte(2));
+        assert!(state
+            .validate(U256::from(1), B256::repeat_byte(1), B256::repeat_byte(3))
+            .is_err());
     }
 }

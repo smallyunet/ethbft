@@ -1,6 +1,8 @@
+use crate::protocol::{payload_versioned_hashes, EngineApiVersion, ExecutionEnvelope};
 use alloy_primitives::{B256, U256};
 use alloy_rpc_types_engine::{
-    ExecutionPayloadV2, ForkchoiceState, ForkchoiceUpdated, PayloadAttributes, PayloadStatus,
+    ExecutionPayload, ExecutionPayloadEnvelopeV3, ExecutionPayloadEnvelopeV4, ExecutionPayloadV2,
+    ForkchoiceState, ForkchoiceUpdated, PayloadAttributes, PayloadStatus,
 };
 use anyhow::{bail, Context};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -10,6 +12,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Sha256;
 use std::{
+    collections::BTreeSet,
     fs,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -18,13 +21,51 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+const ADVERTISED_CAPABILITIES: &[&str] = &[
+    "engine_forkchoiceUpdatedV2",
+    "engine_forkchoiceUpdatedV3",
+    "engine_getPayloadV2",
+    "engine_getPayloadV3",
+    "engine_getPayloadV4",
+    "engine_newPayloadV2",
+    "engine_newPayloadV3",
+    "engine_newPayloadV4",
+    "engine_getClientVersionV1",
+];
+
 #[derive(Clone)]
 pub struct EngineClient {
-    execution_endpoint: String,
-    engine_endpoint: String,
+    endpoint: String,
     jwt_key: Arc<Vec<u8>>,
     http: Client,
     next_id: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EngineCapabilities {
+    methods: BTreeSet<String>,
+}
+
+impl EngineCapabilities {
+    pub fn require(&self, version: EngineApiVersion) -> anyhow::Result<()> {
+        let missing = version
+            .required_capabilities()
+            .into_iter()
+            .filter(|method| !self.methods.contains(*method))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            bail!(
+                "execution client does not support Engine API {}: missing {}",
+                version.number(),
+                missing.join(", ")
+            );
+        }
+        Ok(())
+    }
+
+    pub fn methods(&self) -> impl Iterator<Item = &str> {
+        self.methods.iter().map(String::as_str)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,12 +80,6 @@ struct RpcError {
     message: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GetPayloadV2Result {
-    pub execution_payload: ExecutionPayloadV2,
-}
-
 #[derive(Clone, Debug, Deserialize)]
 pub struct BlockSummary {
     pub hash: B256,
@@ -52,13 +87,27 @@ pub struct BlockSummary {
     pub timestamp: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct BuiltPayload {
+    pub payload: ExecutionPayload,
+    pub parent_beacon_block_root: Option<B256>,
+    pub versioned_hashes: Vec<B256>,
+    pub execution_requests: Vec<alloy_primitives::Bytes>,
+}
+
+// Alloy's untagged V2 response enum tests the V1 shape first, and V1 accepts
+// the additional `withdrawals` field. EthBFT never supports pre-Shanghai
+// payloads, so decode the required post-Shanghai shape without ambiguity.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShanghaiPayloadEnvelope {
+    execution_payload: ExecutionPayloadV2,
+    #[allow(dead_code)]
+    block_value: U256,
+}
+
 impl EngineClient {
-    pub fn new(
-        execution_endpoint: String,
-        engine_endpoint: String,
-        jwt_path: &str,
-        timeout: Duration,
-    ) -> anyhow::Result<Self> {
+    pub fn new(endpoint: String, jwt_path: &str, timeout: Duration) -> anyhow::Result<Self> {
         let secret =
             fs::read_to_string(jwt_path).with_context(|| format!("read JWT secret {jwt_path}"))?;
         let key = hex::decode(secret.trim().trim_start_matches("0x"))
@@ -71,8 +120,7 @@ impl EngineClient {
             .build()
             .context("build HTTP client")?;
         Ok(Self {
-            execution_endpoint,
-            engine_endpoint,
+            endpoint,
             jwt_key: Arc::new(key),
             http,
             next_id: Arc::new(AtomicU64::new(1)),
@@ -84,20 +132,14 @@ impl EngineClient {
         method: &str,
         params: Value,
     ) -> anyhow::Result<T> {
-        let engine = method.starts_with("engine_");
-        let endpoint = if engine {
-            &self.engine_endpoint
-        } else {
-            &self.execution_endpoint
-        };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let mut request = self.http.post(endpoint).json(&json!({
-            "jsonrpc": "2.0", "id": id, "method": method, "params": params,
-        }));
-        if engine {
-            request = request.bearer_auth(self.jwt()?);
-        }
-        let response = request
+        let response = self
+            .http
+            .post(&self.endpoint)
+            .bearer_auth(self.jwt()?)
+            .json(&json!({
+                "jsonrpc": "2.0", "id": id, "method": method, "params": params,
+            }))
             .send()
             .await
             .with_context(|| format!("call {method}"))?;
@@ -134,6 +176,32 @@ impl EngineClient {
         Ok(format!("{input}.{signature}"))
     }
 
+    pub async fn exchange_capabilities(&self) -> anyhow::Result<EngineCapabilities> {
+        let methods: Vec<String> = self
+            .call(
+                "engine_exchangeCapabilities",
+                json!([ADVERTISED_CAPABILITIES]),
+            )
+            .await?;
+        Ok(EngineCapabilities {
+            methods: methods.into_iter().collect(),
+        })
+    }
+
+    pub async fn client_version(&self) -> anyhow::Result<Option<Value>> {
+        match self
+            .call::<Vec<Value>>(
+                "engine_getClientVersionV1",
+                json!([{"code":"EBFT","name":"ethbft","version":crate::VERSION,"commit":""}]),
+            )
+            .await
+        {
+            Ok(mut versions) => Ok(versions.pop()),
+            Err(error) if error.to_string().contains("-32601") => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn chain_id(&self) -> anyhow::Result<U256> {
         let value: String = self.call("eth_chainId", json!([])).await?;
         U256::from_str_radix(value.trim_start_matches("0x"), 16).context("decode eth_chainId")
@@ -153,37 +221,111 @@ impl EngineClient {
         u64::from_str_radix(value.trim_start_matches("0x"), 16).context("decode eth_blockNumber")
     }
 
-    pub async fn submit_raw_transaction(&self, raw: &[u8]) -> anyhow::Result<B256> {
-        self.call(
-            "eth_sendRawTransaction",
-            json!([format!("0x{}", hex::encode(raw))]),
-        )
-        .await
+    pub async fn syncing(&self) -> anyhow::Result<Value> {
+        self.call("eth_syncing", json!([])).await
     }
 
     pub async fn start_payload(
         &self,
+        version: EngineApiVersion,
         state: ForkchoiceState,
         attrs: PayloadAttributes,
     ) -> anyhow::Result<ForkchoiceUpdated> {
-        self.call("engine_forkchoiceUpdatedV2", json!([state, attrs]))
-            .await
+        let method = match version {
+            EngineApiVersion::V2 => "engine_forkchoiceUpdatedV2",
+            EngineApiVersion::V3 | EngineApiVersion::V4 => "engine_forkchoiceUpdatedV3",
+        };
+        self.call(method, json!([state, attrs])).await
     }
 
-    pub async fn get_payload_v2(&self, id: impl Serialize) -> anyhow::Result<GetPayloadV2Result> {
-        self.call("engine_getPayloadV2", json!([id])).await
-    }
-
-    pub async fn new_payload_v2(
+    pub async fn get_payload(
         &self,
-        payload: &ExecutionPayloadV2,
-    ) -> anyhow::Result<PayloadStatus> {
-        self.call("engine_newPayloadV2", json!([payload])).await
+        version: EngineApiVersion,
+        id: impl Serialize,
+        parent_beacon_block_root: Option<B256>,
+    ) -> anyhow::Result<BuiltPayload> {
+        match version {
+            EngineApiVersion::V2 => {
+                let result: ShanghaiPayloadEnvelope =
+                    self.call("engine_getPayloadV2", json!([id])).await?;
+                let payload = ExecutionPayload::V2(result.execution_payload);
+                Ok(BuiltPayload {
+                    payload,
+                    parent_beacon_block_root: None,
+                    versioned_hashes: vec![],
+                    execution_requests: vec![],
+                })
+            }
+            EngineApiVersion::V3 => {
+                let result: ExecutionPayloadEnvelopeV3 =
+                    self.call("engine_getPayloadV3", json!([id])).await?;
+                let payload = ExecutionPayload::V3(result.execution_payload);
+                let versioned_hashes = payload_versioned_hashes(payload.transactions())?;
+                Ok(BuiltPayload {
+                    payload,
+                    parent_beacon_block_root,
+                    versioned_hashes,
+                    execution_requests: vec![],
+                })
+            }
+            EngineApiVersion::V4 => {
+                let result: ExecutionPayloadEnvelopeV4 =
+                    self.call("engine_getPayloadV4", json!([id])).await?;
+                let payload = ExecutionPayload::V3(result.envelope_inner.execution_payload);
+                let versioned_hashes = payload_versioned_hashes(payload.transactions())?;
+                Ok(BuiltPayload {
+                    payload,
+                    parent_beacon_block_root,
+                    versioned_hashes,
+                    execution_requests: result.execution_requests.take(),
+                })
+            }
+        }
     }
 
-    pub async fn update_forkchoice(&self, hash: B256) -> anyhow::Result<ForkchoiceUpdated> {
+    pub async fn new_payload(&self, envelope: &ExecutionEnvelope) -> anyhow::Result<PayloadStatus> {
+        match (&envelope.engine_api, &envelope.payload) {
+            (EngineApiVersion::V2, ExecutionPayload::V2(payload)) => {
+                self.call("engine_newPayloadV2", json!([payload])).await
+            }
+            (EngineApiVersion::V3, ExecutionPayload::V3(payload)) => {
+                self.call(
+                    "engine_newPayloadV3",
+                    json!([
+                        payload,
+                        envelope.versioned_hashes,
+                        envelope.parent_beacon_block_root
+                    ]),
+                )
+                .await
+            }
+            (EngineApiVersion::V4, ExecutionPayload::V3(payload)) => {
+                self.call(
+                    "engine_newPayloadV4",
+                    json!([
+                        payload,
+                        envelope.versioned_hashes,
+                        envelope.parent_beacon_block_root,
+                        envelope.execution_requests
+                    ]),
+                )
+                .await
+            }
+            _ => bail!("payload shape does not match Engine API version"),
+        }
+    }
+
+    pub async fn update_forkchoice(
+        &self,
+        version: EngineApiVersion,
+        hash: B256,
+    ) -> anyhow::Result<ForkchoiceUpdated> {
+        let method = match version {
+            EngineApiVersion::V2 => "engine_forkchoiceUpdatedV2",
+            EngineApiVersion::V3 | EngineApiVersion::V4 => "engine_forkchoiceUpdatedV3",
+        };
         self.call(
-            "engine_forkchoiceUpdatedV2",
+            method,
             json!([ForkchoiceState::same_hash(hash), Value::Null]),
         )
         .await
@@ -201,11 +343,18 @@ mod tests {
         writeln!(file, "{}", "11".repeat(32)).unwrap();
         let client = EngineClient::new(
             "http://localhost".into(),
-            "http://localhost".into(),
             file.path().to_str().unwrap(),
             Duration::from_secs(1),
         )
         .unwrap();
         assert_eq!(client.jwt().unwrap().split('.').count(), 3);
+    }
+
+    #[test]
+    fn capabilities_fail_closed() {
+        let capabilities = EngineCapabilities {
+            methods: ["engine_newPayloadV2".to_string()].into_iter().collect(),
+        };
+        assert!(capabilities.require(EngineApiVersion::V2).is_err());
     }
 }

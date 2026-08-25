@@ -1,18 +1,21 @@
-ethereum:
-  endpoint: "http://geth:8545"
-  engineAPI: "http://geth:8551"
+execution:
+  endpoint: "http://geth:8551"
   jwtSecret: "/app/jwt.hex"
 
 cometbft:
   endpoint: "http://cometbft:26657"
-  homeDir: "/app/cometbft_home"
 
-bridge:
+protocol:
+  shanghaiTime: 0
+  feeRecipient: "0x0000000000000000000000000000000000000000"
+  maxPayloadBytes: 16777216
+
+node:
   listenAddr: "0.0.0.0:8080"
   healthAddr: "0.0.0.0:8081"
   stateFile: "/app/data/ethbft_state.json"
-  appVersion: "0.2.0"
-  maxBridgeLag: 5
+  appVersion: "0.3.0-alpha.1"
+  timeout: 10
+  maxConsensusLag: 5
   stallTimeout: 30
   logLevel: "info"
-  enableBridging: true
