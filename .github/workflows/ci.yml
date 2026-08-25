@@ -45,3 +45,22 @@ jobs:
           ETHBFT_E2E: "1"
           ETHBFT_E2E_NO_BUILD: "1"
         run: cargo test --locked --test e2e -- --nocapture
+
+  multinode-e2e-test:
+    name: Four Validator Fault Recovery
+    runs-on: ubuntu-22.04
+    needs: build-and-test
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.91
+        run: |
+          rustup toolchain install 1.91.0 --profile minimal
+          rustup default 1.91.0
+      - name: Build Docker image
+        run: docker compose -f e2e/multinode/docker-compose.yml build ethbft0
+      - name: Run four-validator fault test
+        env:
+          ETHBFT_MULTINODE_E2E: "1"
+          ETHBFT_MULTINODE_E2E_NO_BUILD: "1"
+        run: cargo test --locked --test multinode_e2e -- --nocapture

@@ -108,7 +108,7 @@ node:
   listenAddr: "0.0.0.0:8080"
   healthAddr: "0.0.0.0:8081"
   stateFile: "/app/data/ethbft_state.json"
-  appVersion: "0.3.0-alpha.1"
+  appVersion: "0.3.0-alpha.2"
   logLevel: "debug"
 "#,
     )

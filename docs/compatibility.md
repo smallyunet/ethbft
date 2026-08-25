@@ -9,7 +9,7 @@ serialization and status behavior.
 
 | Client | Build/validation evidence | Status |
 | --- | --- | --- |
-| Geth | Bundled Shanghai single-validator Docker E2E | Reference integration |
+| Geth | Shanghai single-validator restart and four-validator 3/4 fault-recovery E2E in continuous CI | Reference integration |
 | Reth | Not yet in continuous CI | Candidate |
 | Nethermind | Not yet in continuous CI | Candidate |
 | Besu | Not yet in continuous CI | Candidate |

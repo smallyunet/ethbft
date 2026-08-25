@@ -19,8 +19,9 @@ Monitoring is optional:
 docker compose --profile observability up -d
 ```
 
-For Rust development, install Rust 1.91+ and run `make check`. The full Docker
-path is `make test-e2e`.
+For Rust development, install Rust 1.91+ and run `make check`. The
+single-validator Docker path is `make test-e2e`; the four-validator failure and
+catch-up path is `make test-multinode-e2e`.
 
 Protocol v2 cannot reuse v0.2 chain state. Follow the destructive local-only
 migration command in the repository README only for a disposable network.

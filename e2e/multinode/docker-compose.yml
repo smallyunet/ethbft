@@ -1,0 +1,151 @@
+x-geth: &geth
+  image: ethereum/client-go:v1.17.0@sha256:40a8dc32e3eac888174a0f4aa1182f3a876e8e8ac22129de21ec3538ad0ac664
+  entrypoint: ["/start-geth.sh"]
+  restart: "no"
+  healthcheck:
+    test: ["CMD", "wget", "-q", "--spider", "http://localhost:8545"]
+    interval: 3s
+    timeout: 2s
+    retries: 20
+    start_period: 5s
+  command:
+    - --networkid=1337
+    - --nodiscover
+    - --datadir=/root/.ethereum
+    - --http
+    - --http.addr=0.0.0.0
+    - --http.port=8545
+    - --http.api=eth,net,web3,txpool
+    - --http.vhosts=*
+    - --syncmode=full
+    - --authrpc.addr=0.0.0.0
+    - --authrpc.port=8551
+    - --authrpc.jwtsecret=/jwt.hex
+    - --authrpc.vhosts=*
+
+x-ethbft: &ethbft
+  image: ethbft-multinode:local
+  restart: "no"
+  healthcheck:
+    test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8081/live"]
+    interval: 3s
+    timeout: 2s
+    retries: 20
+    start_period: 3s
+
+x-comet: &comet
+  image: cometbft/cometbft:v0.38.21@sha256:97201755bec7079c41d3ec8f0de3b55bc11f8b590046bc31dd616727d0fbb47f
+  entrypoint: ["/start-cometbft.sh"]
+  user: "0:0"
+  restart: "no"
+
+services:
+  geth0:
+    <<: *geth
+    ports: ["127.0.0.1:18545:8545"]
+    volumes:
+      - ./data/geth0:/root/.ethereum
+      - ./data/jwt.hex:/jwt.hex
+      - ../../scripts/start-geth.sh:/start-geth.sh
+  geth1:
+    <<: *geth
+    ports: ["127.0.0.1:18555:8545"]
+    volumes:
+      - ./data/geth1:/root/.ethereum
+      - ./data/jwt.hex:/jwt.hex
+      - ../../scripts/start-geth.sh:/start-geth.sh
+  geth2:
+    <<: *geth
+    ports: ["127.0.0.1:18565:8545"]
+    volumes:
+      - ./data/geth2:/root/.ethereum
+      - ./data/jwt.hex:/jwt.hex
+      - ../../scripts/start-geth.sh:/start-geth.sh
+  geth3:
+    <<: *geth
+    ports: ["127.0.0.1:18575:8545"]
+    volumes:
+      - ./data/geth3:/root/.ethereum
+      - ./data/jwt.hex:/jwt.hex
+      - ../../scripts/start-geth.sh:/start-geth.sh
+
+  ethbft0:
+    <<: *ethbft
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    depends_on:
+      geth0: { condition: service_healthy }
+    ports: ["127.0.0.1:18081:8081"]
+    environment: ["ETHBFT_CONFIG=/app/config.yaml"]
+    volumes:
+      - ./data/config0.yaml:/app/config.yaml
+      - ./data/jwt.hex:/app/jwt.hex
+      - ./data/ethbft0:/app/data
+  ethbft1:
+    <<: *ethbft
+    depends_on:
+      geth1: { condition: service_healthy }
+    ports: ["127.0.0.1:18091:8081"]
+    environment: ["ETHBFT_CONFIG=/app/config.yaml"]
+    volumes:
+      - ./data/config1.yaml:/app/config.yaml
+      - ./data/jwt.hex:/app/jwt.hex
+      - ./data/ethbft1:/app/data
+  ethbft2:
+    <<: *ethbft
+    depends_on:
+      geth2: { condition: service_healthy }
+    ports: ["127.0.0.1:18101:8081"]
+    environment: ["ETHBFT_CONFIG=/app/config.yaml"]
+    volumes:
+      - ./data/config2.yaml:/app/config.yaml
+      - ./data/jwt.hex:/app/jwt.hex
+      - ./data/ethbft2:/app/data
+  ethbft3:
+    <<: *ethbft
+    depends_on:
+      geth3: { condition: service_healthy }
+    ports: ["127.0.0.1:18111:8081"]
+    environment: ["ETHBFT_CONFIG=/app/config.yaml"]
+    volumes:
+      - ./data/config3.yaml:/app/config.yaml
+      - ./data/jwt.hex:/app/jwt.hex
+      - ./data/ethbft3:/app/data
+
+  comet0:
+    <<: *comet
+    depends_on:
+      ethbft0: { condition: service_healthy }
+    ports: ["127.0.0.1:26657:26657"]
+    environment: ["ETHBFT_PROXY_APP_HOST=ethbft0"]
+    volumes:
+      - ./data/comet/node0:/cometbft
+      - ../../scripts/start-cometbft.sh:/start-cometbft.sh
+  comet1:
+    <<: *comet
+    depends_on:
+      ethbft1: { condition: service_healthy }
+    ports: ["127.0.0.1:27657:26657"]
+    environment: ["ETHBFT_PROXY_APP_HOST=ethbft1"]
+    volumes:
+      - ./data/comet/node1:/cometbft
+      - ../../scripts/start-cometbft.sh:/start-cometbft.sh
+  comet2:
+    <<: *comet
+    depends_on:
+      ethbft2: { condition: service_healthy }
+    ports: ["127.0.0.1:28657:26657"]
+    environment: ["ETHBFT_PROXY_APP_HOST=ethbft2"]
+    volumes:
+      - ./data/comet/node2:/cometbft
+      - ../../scripts/start-cometbft.sh:/start-cometbft.sh
+  comet3:
+    <<: *comet
+    depends_on:
+      ethbft3: { condition: service_healthy }
+    ports: ["127.0.0.1:29657:26657"]
+    environment: ["ETHBFT_PROXY_APP_HOST=ethbft3"]
+    volumes:
+      - ./data/comet/node3:/cometbft
+      - ../../scripts/start-cometbft.sh:/start-cometbft.sh

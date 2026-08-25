@@ -6,8 +6,9 @@ height; each validator independently validates that payload through the
 standard authenticated Engine API.
 
 > **Status: v0.3 alpha / pre-production.** Protocol v2 and the Rust runtime are
-> implemented. The included Geth single-validator stack is an integration
-> environment, not evidence that the production acceptance gates have passed.
+> implemented. Geth/Shanghai runs continuously in single-validator and
+> four-validator fault-recovery tests, but the production acceptance gates have
+> not passed.
 
 ## Design
 
@@ -151,6 +152,7 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 ETHBFT_E2E=1 cargo test --locked --test e2e -- --nocapture
+ETHBFT_MULTINODE_E2E=1 cargo test --locked --test multinode_e2e -- --nocapture
 ```
 
 Rust 1.91 is the minimum supported version. Engine API is private,

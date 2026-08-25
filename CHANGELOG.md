@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.3.0-alpha.2 - Unreleased
+
+### Added
+
+- Added a four-validator Compose topology with four independent Geth datadirs,
+  four EthBFT adapters, and a shared four-validator CometBFT genesis.
+- Added continuous fault-recovery coverage that stops one complete validator
+  stack, verifies the remaining 3/4 network keeps committing, and then checks
+  consensus and execution catch-up after restart.
+- Added cross-node assertions for CometBFT block/app hashes, Ethereum block
+  hashes, transaction inclusion, and receipts.
+
+### Limitations
+
+- The four-validator harness runs on one Docker host. It is strong integration
+  evidence, but does not satisfy the multi-host, partition, Byzantine, mixed
+  client, state-sync, performance, or security-audit production gates.
+
 ## v0.3.0-alpha.1 - Unreleased
 
 ### Changed

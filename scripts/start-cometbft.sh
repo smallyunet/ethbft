@@ -19,10 +19,12 @@ fi
 sed -i 's/^type = "flood"$/type = "nop"/' /cometbft/config/config.toml
 sed -i 's/^indexer = "kv"$/indexer = "null"/' /cometbft/config/config.toml
 
+PROXY_APP_HOST=${ETHBFT_PROXY_APP_HOST:-ethbft}
+
 exec cometbft start \
   --home=/cometbft \
   --log_level=info \
   --abci=socket \
-  --proxy_app=tcp://ethbft:8080 \
+  --proxy_app=tcp://${PROXY_APP_HOST}:8080 \
   --rpc.laddr=tcp://0.0.0.0:26657 \
   --p2p.laddr=tcp://0.0.0.0:26656

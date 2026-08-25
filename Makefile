@@ -1,4 +1,4 @@
-.PHONY: all build run clean test lint check test-e2e test-e2e-fast deploy docker-up docker-down docker-rebuild generate-jwt create-genesis deps
+.PHONY: all build run clean test lint check test-e2e test-e2e-fast test-multinode-e2e test-multinode-e2e-fast deploy docker-up docker-down docker-rebuild generate-jwt create-genesis deps
 
 BINARY_NAME=ethbft
 
@@ -30,6 +30,12 @@ test-e2e:
 
 test-e2e-fast:
 	ETHBFT_E2E=1 ETHBFT_E2E_NO_BUILD=1 cargo test --locked --test e2e -- --nocapture
+
+test-multinode-e2e:
+	ETHBFT_MULTINODE_E2E=1 cargo test --locked --test multinode_e2e -- --nocapture
+
+test-multinode-e2e-fast:
+	ETHBFT_MULTINODE_E2E=1 ETHBFT_MULTINODE_E2E_NO_BUILD=1 cargo test --locked --test multinode_e2e -- --nocapture
 
 deploy:
 	./scripts/deploy.sh

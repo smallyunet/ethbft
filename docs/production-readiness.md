@@ -20,6 +20,18 @@ required gate is linked from this page.
 - [ ] Threat model and independent security audit with resolved findings
 - [ ] Reproducible builds, SBOM, signed artifacts, and rollback rehearsal
 
+## Evidence completed in the alpha
+
+- [x] Four validators with independent Geth datadirs agree on CometBFT block
+      hashes, app hashes, Ethereum block hashes, and transaction receipts on one
+      Docker host.
+- [x] The network continues committing with one complete validator stack
+      stopped, and the stopped CometBFT/EthBFT/Geth stack catches up after
+      restart.
+
+These checks deliberately do not close the 4+ validator production gate: that
+gate requires separate hosts and the broader failure matrix above.
+
 ## Deployment invariants
 
 Engine API is never public. Each validator's EthBFT process is the only
