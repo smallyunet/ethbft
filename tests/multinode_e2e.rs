@@ -163,10 +163,17 @@ node:
     }
     make_tree_writable(&data);
 
+    let container_user = format!("{}:{}", host_id("-u"), host_id("-g"));
     let output = Command::new("docker")
         .args([
             "run",
             "--rm",
+            "--user",
+            &container_user,
+            "--entrypoint",
+            "cometbft",
+            "-e",
+            "CMTHOME=/out/.home",
             "-v",
             &format!("{}:/out", data.join("comet").display()),
             "cometbft/cometbft:v0.38.21@sha256:97201755bec7079c41d3ec8f0de3b55bc11f8b590046bc31dd616727d0fbb47f",
@@ -187,6 +194,18 @@ node:
         .expect("failed to run CometBFT testnet generator");
     assert!(output.success(), "CometBFT testnet generation failed");
     make_tree_writable(&data);
+}
+
+fn host_id(flag: &str) -> String {
+    let output = Command::new("id")
+        .arg(flag)
+        .output()
+        .expect("failed to query the host user ID");
+    assert!(output.status.success(), "id {flag} failed");
+    String::from_utf8(output.stdout)
+        .expect("host user ID was not UTF-8")
+        .trim()
+        .to_owned()
 }
 
 #[cfg(unix)]
