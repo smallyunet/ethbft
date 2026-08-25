@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.2.0 - 2026-08-25
+
+### Changed
+
+- Rewrote the EthBFT application, Engine API client, ABCI++ server, protocol
+  codec, state persistence, health endpoints, metrics, and E2E harness in Rust.
+- Preserved the protocol-v1 RLP proposal envelope byte-for-byte with a Go/Rust
+  golden fixture.
+- Replaced the unjournaled FinalizeBlock-to-Commit window with a durable,
+  replayable execution commit intent.
+- Kept CometBFT v0.38 as the default consensus engine and isolated the
+  execution core behind a consensus-neutral Rust trait.
+- Replaced Go CI, builds, tests, and Docker packaging with Cargo equivalents.
+
+### Compatibility
+
+- Requires a new chain: the Rust state format is version 4 and is intentionally
+  incompatible with the v0.1.x JSON state file.
+- Protocol v1 remains Shanghai-only and uses Engine API V2.
+
 ## v0.1.1 - 2026-07-20
 
 ### Fixed

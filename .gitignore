@@ -6,18 +6,9 @@
 *.dylib
 /ethbft
 
-# Test binary, built with `go test -c`
-*.test
-
-# Output of the go coverage tool
-*.out
-
-# Dependency directories
-vendor/
+# Rust build output
+/target/
 /docs/node_modules/
-
-# Go module cache
-.gocache/
 
 # Generated JWT secret
 jwt.hex

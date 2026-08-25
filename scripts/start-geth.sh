@@ -5,7 +5,7 @@ set -e
 # before starting with the provided arguments.
 
 DATADIR=${DATADIR:-/root/.ethereum}
-GENESIS=${GENESIS:-/genesis.json}
+GENESIS=${GENESIS:-/root/.ethereum/genesis.json}
 
 if [ -f "$GENESIS" ]; then
   if [ ! -d "$DATADIR/geth/chaindata" ] || [ -z "$(ls -A "$DATADIR/geth/chaindata" 2>/dev/null || true)" ]; then
@@ -28,4 +28,3 @@ fi
 
 echo "[start-geth] Starting geth with args: $*"
 exec geth "$@"
-

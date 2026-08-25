@@ -1,48 +1,42 @@
-.PHONY: build run clean test test-e2e test-e2e-fast deploy docker-up docker-down docker-rebuild generate-jwt create-genesis deps
+.PHONY: all build run clean test lint check test-e2e test-e2e-fast deploy docker-up docker-down docker-rebuild generate-jwt create-genesis deps
 
-# Project variables
 BINARY_NAME=ethbft
-MAIN_PKG=./cmd/ethbft
 
-# Go parameters
-GOCMD=go
-GOBUILD=$(GOCMD) build
-GOCLEAN=$(GOCMD) clean
-GOTEST=$(GOCMD) test
-GOMOD=$(GOCMD) mod
-
-all: test build
+all: check build
 
 build:
-	$(GOBUILD) -o $(BINARY_NAME) $(MAIN_PKG)
+	cargo build --release --locked
+	cp target/release/$(BINARY_NAME) ./$(BINARY_NAME)
 
-run: build
-	./$(BINARY_NAME)
+run:
+	cargo run --locked
 
 clean:
-	$(GOCLEAN)
+	cargo clean
 	rm -f $(BINARY_NAME)
-	rm -rf ./cometbft_home
-	rm -rf ./geth_data
+	rm -rf ./cometbft_home ./geth_data
 
 test:
-	$(GOTEST) -v ./...
+	cargo test --locked --all-targets
+
+lint:
+	cargo fmt --all -- --check
+	cargo clippy --locked --all-targets -- -D warnings
+
+check: lint test
 
 test-e2e:
-	ETHBFT_E2E=1 $(GOTEST) -v ./e2e/...
+	ETHBFT_E2E=1 cargo test --locked --test e2e -- --nocapture
 
 test-e2e-fast:
-	ETHBFT_E2E=1 ETHBFT_E2E_NO_BUILD=1 $(GOTEST) -v ./e2e/...
+	ETHBFT_E2E=1 ETHBFT_E2E_NO_BUILD=1 cargo test --locked --test e2e -- --nocapture
 
-# Deploy full stack with monitoring and explorer
 deploy:
 	./scripts/deploy.sh
 
-# Install dependencies
 deps:
-	$(GOMOD) download
+	cargo fetch --locked
 
-# Generate JWT secret for Engine API authentication (skip if exists)
 generate-jwt:
 	@if [ ! -f jwt.hex ]; then \
 		printf "%s" "$$(openssl rand -hex 32)" > jwt.hex; \
@@ -51,28 +45,17 @@ generate-jwt:
 		echo "JWT secret already exists at jwt.hex, skipping"; \
 	fi
 
-# Create genesis.json file
 create-genesis:
 	mkdir -p ./geth_data
 	@echo "Creating genesis.json file..."
-	@echo '{\n  "config": {\n    "chainId": 1337,\n    "homesteadBlock": 0,\n    "eip150Block": 0,\n    "eip155Block": 0,\n    "eip158Block": 0,\n    "byzantiumBlock": 0,\n    "constantinopleBlock": 0,\n    "petersburgBlock": 0,\n    "istanbulBlock": 0,\n    "berlinBlock": 0,\n    "londonBlock": 0,\n    "mergeForkBlock": 0,\n    "terminalTotalDifficulty": 0,\n    "shanghaiTime": 0\n  },\n  "alloc": {},\n  "difficulty": "1",\n  "gasLimit": "30000000"\n}' > ./geth_data/genesis.json
-	@echo "Genesis file created at ./geth_data/genesis.json"
+	@echo '{\n  "config": {\n    "chainId": 1337,\n    "homesteadBlock": 0,\n    "eip150Block": 0,\n    "eip155Block": 0,\n    "eip158Block": 0,\n    "byzantiumBlock": 0,\n    "constantinopleBlock": 0,\n    "petersburgBlock": 0,\n    "istanbulBlock": 0,\n    "berlinBlock": 0,\n    "londonBlock": 0,\n    "terminalTotalDifficulty": 0,\n    "shanghaiTime": 0\n  },\n  "alloc": {},\n  "difficulty": "1",\n  "gasLimit": "30000000"\n}' > ./geth_data/genesis.json
 
-# Start Docker environment
 docker-up: generate-jwt create-genesis
-	@echo "Starting Docker environment..."
-	docker-compose up -d
-	@echo "Docker environment started in detached mode"
+	docker compose up -d
 
-# Stop Docker environment
 docker-down:
-	@echo "Stopping Docker environment..."
-	docker-compose down
-	@echo "Docker environment stopped"
+	docker compose down
 
-# Rebuild Docker containers
 docker-rebuild: docker-down generate-jwt create-genesis
-	@echo "Rebuilding Docker containers..."
-	docker-compose build
-	@echo "Rebuild complete, starting containers..."
-	docker-compose up -d
+	docker compose build
+	docker compose up -d

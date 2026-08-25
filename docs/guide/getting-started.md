@@ -2,7 +2,7 @@
 
 ## 🛠️ Prerequisites
 
-- **Go 1.25.12+**
+- **Rust 1.91+**
 - **Docker & Docker Compose** (recommended path)
 - **OpenSSL** (for JWT secret generation)
 
@@ -25,7 +25,7 @@ docker-compose logs -f
 ```
 
 If the machine previously ran v0.0.x, delete the disposable development-chain
-state before starting v0.1.0:
+state before starting v0.2.0:
 
 ```bash
 docker-compose down -v

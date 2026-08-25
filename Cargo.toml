@@ -1,0 +1,44 @@
+[package]
+name = "ethbft"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.91"
+description = "A BFT consensus adapter for Ethereum execution-layer clients"
+license = "MIT"
+repository = "https://github.com/smallyunet/ethbft"
+
+[dependencies]
+alloy-consensus = { version = "=1.0.42", features = ["k256", "serde"] }
+alloy-eips = { version = "=1.0.42", features = ["serde"] }
+alloy-primitives = { version = "=1.4.1", features = ["serde", "rlp"] }
+alloy-rlp = { version = "0.3.12", features = ["derive"] }
+alloy-rpc-types-engine = "=1.0.42"
+alloy-tx-macros = "=1.0.42"
+anyhow = "1.0.99"
+async-trait = "0.1.89"
+axum = "0.8.4"
+base64 = "0.22.1"
+bytes = { version = "1.10.1", features = ["serde"] }
+futures = "0.3.31"
+hex = "0.4.3"
+hmac = "0.12.1"
+prometheus = "0.14.0"
+reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
+serde_yaml = "0.9.34"
+sha2 = "0.10.9"
+tokio = { version = "1.47.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tendermint = "0.40.4"
+tower = { version = "0.5.2", features = ["buffer", "limit", "load-shed", "util"] }
+tower-abci = "0.19.1"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+tempfile = "3.21.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

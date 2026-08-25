@@ -6,7 +6,7 @@
 - **Target release:** EthBFT v0.1.0
 - **Supersedes:** The asynchronous transaction-delivery protocol used through v0.0.10
 
-> **MVP implementation:** v0.1.0 implements the Engine API V2 proposal,
+> **MVP implementation:** v0.2.0 implements the Engine API V2 proposal,
 > validation, execution commitment, and crash-recovery core of this RFC. The RFC
 > remains Draft until multi-validator E2E, genesis-backed protocol parameters,
 > transactional storage, and paired ABCI/EL state sync are complete.
@@ -197,7 +197,7 @@ payload that fits, or propose an empty execution block.
 ### Encoding
 
 `ExecutionMetadata` MUST use the versioned canonical RLP codec defined in the
-implementation package `pkg/protocol`. It is encoded as one RLP list whose field
+implementation module `src/protocol.rs`. It is encoded as one RLP list whose field
 order is the order in `ExecutionMetadata` below. Integers use RLP's minimal
 unsigned big-endian representation; fixed hashes and addresses use their raw
 byte representation. Unknown versions, non-minimal integer encodings, trailing
@@ -755,7 +755,7 @@ transaction root, app hash, and canonical EL head across all honest validators.
 
 ### Milestone 1: Protocol types
 
-- Add `pkg/protocol` with versioned metadata and deterministic hashing.
+- Add `src/protocol.rs` with versioned metadata and deterministic hashing.
 - Move consensus parameters into a genesis-backed structure.
 - Add golden encoding and hash vectors.
 

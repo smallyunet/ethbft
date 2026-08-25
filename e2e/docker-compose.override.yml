@@ -3,7 +3,6 @@ services:
     volumes:
       - ./e2e/data/geth:/root/.ethereum
       - ./e2e/data/jwt.hex:/jwt.hex
-      - ./e2e/data/geth/genesis.json:/genesis.json
 
   ethbft:
     volumes:

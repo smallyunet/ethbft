@@ -13,8 +13,8 @@ if ! command -v docker &> /dev/null; then
     echo "Error: docker is not installed."
     exit 1
 fi
-if ! command -v go &> /dev/null; then
-    echo "Error: go is not installed."
+if ! command -v cargo &> /dev/null; then
+    echo "Error: Rust/Cargo is not installed."
     exit 1
 fi
 

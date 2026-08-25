@@ -4,7 +4,7 @@ EthBFT is a thin BFT consensus adapter for Ethereum Execution Layer clients.
 CometBFT decides complete Ethereum execution payloads, and every validator asks
 an independent Geth node to validate the same state transition.
 
-> **Status:** v0.1.1 MVP. The default Docker network has one validator. The
+> **Status:** v0.2.0 MVP. The default Docker network has one validator. The
 > protocol path is designed for one dedicated EL per CometBFT validator, but the
 > project is not yet a production multi-validator network.
 

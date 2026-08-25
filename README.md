@@ -5,11 +5,11 @@ CometBFT reaches consensus on complete Ethereum execution payloads, while each
 validator uses an independent Geth Engine API to validate the proposed state
 transition.
 
-> **Status: v0.1.1 MVP.** The execution-payload consensus loop is implemented
+> **Status: v0.2.0 MVP.** The execution-payload consensus loop is implemented
 > and covered by a single-validator Docker E2E test. The bundled Compose stack
 > is a development network, not a production multi-validator deployment.
 
-## What v0.1.0 Implements
+## What v0.2.0 Implements
 
 - **Payload consensus:** the proposer places deterministic execution metadata
   and the exact ordered payload transactions in the CometBFT proposal.
@@ -23,9 +23,9 @@ transition.
   and transaction root.
 - **Exact transaction order:** CometBFT proposal order is the order in the
   Ethereum execution payload.
-- **Crash recovery:** startup reconciles persisted CometBFT height and EL block
-  history, restores committed forkchoice, and rejects incompatible legacy
-  state.
+- **Crash recovery:** a durable commit-intent journal bridges `FinalizeBlock`,
+  EL forkchoice, and ABCI `Commit`; startup safely resumes interrupted commits
+  and rejects incompatible legacy state.
 - **Deterministic envelope:** protocol-v1 metadata uses canonical RLP with a
   reserved `ETHBFT\x00\x01` prefix.
 - **Operations:** JSON logs, Prometheus metrics, liveness/readiness checks, and
@@ -38,7 +38,8 @@ Protocol v1 intentionally stays small:
 - Engine API V2 and a Shanghai-only execution chain.
 - Empty withdrawals and no blob transactions.
 - One fixed fee recipient configured identically on every validator.
-- Atomic, fsynced state-file persistence rather than a transactional database.
+- Atomic, fsynced state-file and commit-intent persistence rather than a
+  transactional database.
 - No ABCI/EL snapshot state sync.
 - No dynamic validator or protocol-parameter updates.
 - No Ethereum-mainnet bridge, light-client proof, or asset custody protocol.
@@ -79,7 +80,7 @@ execution payload, that exact membership and order is agreed by CometBFT.
 
 ### Prerequisites
 
-- Go 1.25.12+
+- Rust 1.91+
 - Docker with Compose
 - OpenSSL
 
@@ -158,7 +159,7 @@ bridge:
   listenAddr: "0.0.0.0:8080"
   healthAddr: "0.0.0.0:8081"
   stateFile: "ethbft_state.json"
-  appVersion: "0.1.1"
+  appVersion: "0.2.0"
   timeout: 10
   logLevel: "info"
   enableBridging: true
@@ -203,26 +204,27 @@ required order.
 
 ```bash
 make test
-go test -race ./pkg/...
-go vet ./...
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
 
 # Full Docker execution path
-ETHBFT_E2E=1 go test -v -count=1 -timeout 10m ./e2e/...
+ETHBFT_E2E=1 cargo test --locked --test e2e -- --nocapture
 ```
 
-CI runs build, unit tests, vet, race detection, vulnerability scanning, and the
+CI runs formatting, Clippy, unit and integration tests, a release build, and the
 Docker E2E test.
 
 ## Project Structure
 
 ```text
-cmd/ethbft/          application entry point
-pkg/bridge/          ABCI lifecycle, Engine API orchestration, persistence
-pkg/protocol/        versioned execution proposal encoding
-pkg/ethereum/        authenticated Ethereum JSON-RPC client
-pkg/consensus/       CometBFT RPC client
-pkg/config/          local configuration
-e2e/                 Docker execution-path tests
+src/abci.rs          CometBFT ABCI++ v0.38 adapter
+src/node.rs          consensus-neutral execution lifecycle
+src/engine.rs        authenticated Ethereum Engine API transport
+src/protocol.rs      versioned execution proposal encoding
+src/state.rs         commit journal, persistence, and reconciliation
+src/config.rs        local configuration
+tests/e2e.rs         Docker execution-path test
 docs/rfc/            consensus protocol specifications
 ```
 
@@ -234,7 +236,7 @@ docs/rfc/            consensus protocol specifications
 - Validator EL datadirs must never be shared.
 - A validator whose EL returns `SYNCING`, `ACCEPTED`, times out, or diverges
   rejects the proposal and must be treated as not ready.
-- v0.1.1 has not received an independent security audit.
+- v0.2.0 has not received an independent security audit.
 
 ## Docker Services
 

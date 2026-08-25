@@ -42,8 +42,8 @@ Protocol v1 metadata binds:
 - timestamp, randomness, fee recipient, gas, bloom, and base fee; and
 - an explicit empty withdrawal list.
 
-Geth's `ExecutableDataToBlock` recomputes the Ethereum header and block hash
-before the payload is sent to the local Engine API.
+EthBFT reconstructs the Ethereum header and recomputes the block hash before
+the payload is sent to the local Engine API.
 
 ## ABCI lifecycle
 
@@ -61,9 +61,10 @@ wrong parents, wrong timestamps, and incorrect block hashes reject the proposal.
 
 ### FinalizeBlock and Commit
 
-`FinalizeBlock` revalidates the decided payload and advances EL forkchoice.
-`Commit` atomically persists the ABCI app hash and height mapping. Until Commit
-succeeds, `Info` continues to report the previous height.
+`FinalizeBlock` revalidates the decided payload, persists a commit intent, and
+advances EL forkchoice. `Commit` atomically persists the ABCI app hash and
+height mapping, then clears the intent. Startup resumes an interrupted intent;
+until `Commit` succeeds, `Info` continues to report the previous height.
 
 ## Execution commitment
 
@@ -86,9 +87,9 @@ committed block as EL head, safe, and finalized.
 ## Code layout
 
 ```text
-pkg/protocol/proposal.go  canonical execution envelope
-pkg/bridge/server.go      ABCI lifecycle
-pkg/bridge/engine.go      proposal building and EL validation
-pkg/bridge/state.go       commit persistence and reconciliation
-pkg/ethereum/client.go    authenticated Engine API transport
+src/protocol.rs  canonical execution envelope
+src/abci.rs      CometBFT ABCI++ v0.38 lifecycle adapter
+src/node.rs      proposal building and EL validation
+src/state.rs     commit journal, persistence, and reconciliation
+src/engine.rs    authenticated Engine API transport
 ```
